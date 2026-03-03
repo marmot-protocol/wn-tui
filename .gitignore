@@ -1,0 +1,23 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Rust
+/target
+
+# AI Agent files
+.claude/
+.cursor/
+.opencode/
+.aider/
+.cody/
+.continue/
+.github-copilot/
+.goose/
+.agent
+
+# Coverage reports
+lcov.info
+*.profraw
+*.profdata
