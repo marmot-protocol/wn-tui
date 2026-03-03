@@ -69,22 +69,16 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
                             .and_then(|v| v.as_str())
                     })
                     .unwrap_or("unknown");
-                let npub = user
-                    .get("pubkey")
-                    .or_else(|| user.get("npub"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let short_npub = if npub.len() > 20 {
-                    format!("{}...", &npub[..17])
-                } else {
-                    npub.to_string()
-                };
-
                 let pubkey = user
                     .get("pubkey")
                     .or_else(|| user.get("npub"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let short_npub = if pubkey.len() > 20 {
+                    format!("{}...", &pubkey[..17])
+                } else {
+                    pubkey.to_string()
+                };
                 let is_following = app.is_following(pubkey);
                 let follow_badge = if is_following { " [following]" } else { "" };
 

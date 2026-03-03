@@ -709,10 +709,10 @@ fn extract_npub_login(val: serde_json::Value) -> Action {
 
 /// Find the daemon log directory based on platform and build mode.
 fn daemon_logs_dir() -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
+    let _home = dirs::home_dir()?;
     // Check both release and dev dirs — daemon build mode may differ from TUI build mode
     #[cfg(target_os = "macos")]
-    let base = home.join("Library").join("Logs").join("whitenoise-cli");
+    let base = _home.join("Library").join("Logs").join("whitenoise-cli");
     #[cfg(not(target_os = "macos"))]
     let base = dirs::data_dir()?.join("whitenoise-cli").join("logs");
     Some(base)

@@ -1620,6 +1620,8 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
         Screen::Profile => {
             lines.push(hint("n", "Edit name"));
             lines.push(hint("a", "Edit about"));
+            lines.push(hint("j / k", "Navigate follows"));
+            lines.push(hint("d", "Unfollow"));
             lines.push(hint("Esc", "Back"));
         }
         Screen::Settings => {
@@ -1632,7 +1634,8 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
         }
         Screen::UserSearch => {
             lines.push(hint("Enter", "Search"));
-            lines.push(hint("j / k", "Navigate results"));
+            lines.push(hint("↑ / ↓", "Navigate results"));
+            lines.push(hint("Tab", "Follow / Unfollow"));
             lines.push(hint("Esc", "Back"));
         }
     }
