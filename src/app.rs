@@ -186,6 +186,9 @@ impl App {
             }
             Action::Tick | Action::Render => {}
             Action::Key(key) => return self.handle_key(key),
+            Action::Paste(text) => {
+                self.handle_paste(&text);
+            }
 
             // Login
             Action::AccountsLoaded(accounts) => {
@@ -215,8 +218,10 @@ impl App {
             }
 
             // Message streaming
-            Action::MessageUpdate(val) => {
-                self.handle_message_update(val);
+            Action::MessageUpdate { group_id, message } => {
+                if self.active_group_id.as_deref() == Some(&group_id) {
+                    self.handle_message_update(message);
+                }
             }
             Action::MessageStreamEnded => {}
 
@@ -264,6 +269,12 @@ impl App {
                 // Reload group detail if still on that screen
                 if self.screen == Screen::GroupDetail {
                     return self.reload_group_detail();
+                }
+                // Re-subscribe to chats to pick up changes
+                if let Some(account) = &self.account {
+                    return vec![Effect::SubscribeChats {
+                        account: account.clone(),
+                    }];
                 }
             }
             Action::GroupActionError(msg) => {
@@ -375,9 +386,11 @@ impl App {
         self.unread_counts.clear();
         self.connected = false;
         self.popup = None;
+        let acct = account.clone();
         vec![
             Effect::SubscribeNotifications,
             Effect::SubscribeChats { account },
+            Effect::LoadProfile { account: acct },
             Effect::TailDaemonLog,
         ]
     }
@@ -385,6 +398,14 @@ impl App {
     /// Total unread messages across all chats.
     pub fn total_unread(&self) -> usize {
         self.unread_counts.values().sum()
+    }
+
+    /// Count of chats with pending invitations (pending_confirmation == true).
+    pub fn pending_invites(&self) -> usize {
+        self.chats
+            .iter()
+            .filter(|c| c.get("pending_confirmation").and_then(|v| v.as_bool()) == Some(true))
+            .count()
     }
 
     fn handle_accounts_loaded(&mut self, accounts: Vec<Value>) -> Vec<Effect> {
@@ -420,7 +441,31 @@ impl App {
         self.chats.push(val);
     }
 
+    fn handle_paste(&mut self, text: &str) {
+        let input = match self.screen {
+            Screen::Login => Some(&mut self.nsec_input),
+            Screen::UserSearch => Some(&mut self.search_input),
+            Screen::Main if self.focus == Panel::Composer => Some(&mut self.composer),
+            _ => None,
+        };
+        if let Some(input) = input {
+            for ch in text.chars() {
+                input.insert(ch);
+            }
+        }
+    }
+
     fn handle_message_update(&mut self, val: Value) {
+        // Deduplicate by message id
+        if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
+            if self
+                .messages
+                .iter()
+                .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id))
+            {
+                return;
+            }
+        }
         let was_at_bottom = self.message_scroll == 0;
         self.messages.push(val);
         if !was_at_bottom {
@@ -434,8 +479,11 @@ impl App {
             return self.handle_popup_key(key);
         }
 
-        // Global: `?` opens help overlay (except in text-input-heavy screens)
-        if key.code == KeyCode::Char('?') && !matches!(self.screen, Screen::UserSearch) {
+        // Global: `?` opens help overlay (except when typing)
+        if key.code == KeyCode::Char('?')
+            && !matches!(self.screen, Screen::UserSearch)
+            && self.focus != Panel::Composer
+        {
             self.popup = Some(Popup::Help {
                 screen: self.screen.clone(),
             });
@@ -684,10 +732,9 @@ impl App {
     fn invite_group_id(&self, idx: usize) -> Option<String> {
         if let Some(Popup::Invites { items, .. }) = &self.popup {
             items.get(idx).and_then(|inv| {
-                inv.get("mls_group_id")
-                    .or_else(|| inv.get("group_id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
+                // Try nested group object first (actual CLI format)
+                let group = inv.get("group").unwrap_or(inv);
+                chat_list::group_id(group)
             })
         } else {
             None
@@ -710,11 +757,15 @@ impl App {
                 if !self.chats.is_empty() {
                     self.selected_chat = (self.selected_chat + 1).min(self.chats.len() - 1);
                 }
-                vec![]
+                let effects = self.select_chat();
+                self.focus = Panel::ChatList; // stay in chat list while browsing
+                effects
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected_chat = self.selected_chat.saturating_sub(1);
-                vec![]
+                let effects = self.select_chat();
+                self.focus = Panel::ChatList;
+                effects
             }
             KeyCode::Enter => self.select_chat(),
             KeyCode::Tab => {
@@ -1379,9 +1430,10 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(i, inv)| {
-                        let name = inv
+                        let group = inv.get("group").unwrap_or(inv);
+                        let name = group
                             .get("name")
-                            .or_else(|| inv.get("group_name"))
+                            .or_else(|| group.get("group_name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("Unknown group");
                         let marker = if i == *selected { ">" } else { " " };
@@ -1413,6 +1465,22 @@ fn extract_account_id(val: &Value) -> Option<String> {
         .or_else(|| val.get("pubkey"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Convert a hex pubkey to bech32 npub format. Returns the input unchanged on failure.
+pub fn hex_to_npub(hex: &str) -> String {
+    if hex.starts_with("npub") {
+        return hex.to_string();
+    }
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect();
+    if bytes.len() != 32 {
+        return hex.to_string();
+    }
+    bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("npub").unwrap(), &bytes)
+        .unwrap_or_else(|_| hex.to_string())
 }
 
 /// Generate help text lines for the given screen.
@@ -1627,20 +1695,26 @@ mod tests {
     // ── Chat list navigation ─────────────────────────────────────────
 
     #[test]
-    fn chat_list_j_moves_down() {
+    fn chat_list_j_moves_down_and_subscribes() {
         let mut app = app_with_chats();
-        app.update(Action::Key(key(KeyCode::Char('j'))));
+        let effects = app.update(Action::Key(key(KeyCode::Char('j'))));
         assert_eq!(app.selected_chat, 1);
+        assert_eq!(app.active_group_id.as_deref(), Some("g2"));
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::SubscribeMessages { ref group_id, .. } if group_id == "g2")
+        ));
+        assert_eq!(app.focus, Panel::ChatList, "focus stays in chat list");
     }
 
     #[test]
-    fn chat_list_enter_selects_chat() {
+    fn chat_list_enter_selects_and_focuses_messages() {
         let mut app = app_with_chats();
         let effects = app.update(Action::Key(key(KeyCode::Enter)));
         assert_eq!(app.active_group_id.as_deref(), Some("g1"));
         assert!(effects.iter().any(
             |e| matches!(e, Effect::SubscribeMessages { ref group_id, .. } if group_id == "g1")
         ));
+        assert_eq!(app.focus, Panel::Messages, "Enter moves focus to messages");
     }
 
     #[test]
@@ -1711,11 +1785,49 @@ mod tests {
         assert_eq!(app.chats[0]["name"], "Updated");
     }
 
+    fn msg_update(message: Value) -> Action {
+        Action::MessageUpdate {
+            group_id: "g1".into(),
+            message,
+        }
+    }
+
     #[test]
     fn message_update_auto_scrolls_at_bottom() {
         let mut app = app_on_main();
-        app.update(Action::MessageUpdate(json!({"content": "msg"})));
+        app.active_group_id = Some("g1".into());
+        app.update(msg_update(json!({"id": "1", "content": "msg"})));
         assert_eq!(app.message_scroll, 0);
+    }
+
+    #[test]
+    fn message_update_deduplicates_by_id() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.update(msg_update(json!({"id": "msg1", "content": "hello"})));
+        app.update(msg_update(json!({"id": "msg1", "content": "hello"})));
+        app.update(msg_update(json!({"id": "msg2", "content": "world"})));
+        assert_eq!(app.messages.len(), 2);
+    }
+
+    #[test]
+    fn message_update_without_id_always_appends() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.update(msg_update(json!({"content": "no id"})));
+        app.update(msg_update(json!({"content": "no id"})));
+        assert_eq!(app.messages.len(), 2);
+    }
+
+    #[test]
+    fn message_update_ignored_for_wrong_group() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.update(Action::MessageUpdate {
+            group_id: "g2".into(),
+            message: json!({"id": "1", "content": "wrong group"}),
+        });
+        assert_eq!(app.messages.len(), 0);
     }
 
     // ── Notifications ────────────────────────────────────────────────
@@ -1928,6 +2040,44 @@ mod tests {
         assert!(effects
             .iter()
             .any(|e| matches!(e, Effect::LoadGroupDetail { .. })));
+    }
+
+    #[test]
+    fn group_action_success_resubscribes_chats() {
+        let mut app = app_on_main();
+        app.account = Some("abc123".into());
+        let effects = app.update(Action::GroupActionSuccess("Invite accepted".into()));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::SubscribeChats { .. })));
+    }
+
+    #[test]
+    fn pending_invites_counts_from_chats() {
+        let mut app = app_on_main();
+        app.chats = vec![
+            json!({"name": "Active", "pending_confirmation": false}),
+            json!({"name": "Invite1", "pending_confirmation": true}),
+            json!({"name": "Invite2", "pending_confirmation": true}),
+            json!({"name": "NoField"}),
+        ];
+        assert_eq!(app.pending_invites(), 2);
+    }
+
+    #[test]
+    fn pending_invites_zero_when_no_pending() {
+        let mut app = app_on_main();
+        app.chats = vec![json!({"name": "Active", "pending_confirmation": false})];
+        assert_eq!(app.pending_invites(), 0);
+    }
+
+    #[test]
+    fn login_loads_profile() {
+        let mut app = App::new();
+        let effects = app.update(Action::LoginSuccess("npub1xyz".into()));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadProfile { .. })));
     }
 
     #[test]
@@ -2343,10 +2493,11 @@ mod tests {
     #[test]
     fn message_scroll_preserved_when_not_at_bottom() {
         let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
         app.messages = vec![json!({"content": "old"})];
         app.message_scroll = 5; // Scrolled up
 
-        app.update(Action::MessageUpdate(json!({"content": "new"})));
+        app.update(msg_update(json!({"content": "new"})));
         assert_eq!(app.messages.len(), 2);
         assert_eq!(
             app.message_scroll, 6,
@@ -2357,10 +2508,11 @@ mod tests {
     #[test]
     fn message_scroll_stays_at_bottom() {
         let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
         app.messages = vec![json!({"content": "old"})];
         app.message_scroll = 0; // At bottom
 
-        app.update(Action::MessageUpdate(json!({"content": "new"})));
+        app.update(msg_update(json!({"content": "new"})));
         assert_eq!(app.message_scroll, 0, "should auto-scroll");
     }
 
@@ -2411,13 +2563,34 @@ mod tests {
     fn invite_accept_emits_effect() {
         let mut app = app_on_main();
         app.popup = Some(Popup::Invites {
-            items: vec![json!({"mls_group_id": "g1"})],
+            items: vec![json!({
+                "group": {"mls_group_id": "abc123", "name": "Test Group"},
+                "membership": {}
+            })],
             selected: 0,
         });
         let effects = app.update(Action::Key(key(KeyCode::Char('a'))));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::AcceptInvite { .. })));
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::AcceptInvite { ref group_id, .. } if group_id == "abc123")
+        ));
+    }
+
+    #[test]
+    fn invite_group_id_extracts_from_nested_group() {
+        let mut app = app_on_main();
+        app.popup = Some(Popup::Invites {
+            items: vec![json!({
+                "group": {
+                    "mls_group_id": {"value": {"vec": [174, 153, 3]}},
+                    "name": "Test"
+                }
+            })],
+            selected: 0,
+        });
+        let effects = app.update(Action::Key(key(KeyCode::Char('a'))));
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::AcceptInvite { ref group_id, .. } if group_id == "ae9903")
+        ));
     }
 
     // ── Empty input rejection ────────────────────────────────────────
@@ -2501,5 +2674,42 @@ mod tests {
             app.popup.is_none(),
             "? should type into input, not open help"
         );
+    }
+
+    #[test]
+    fn question_mark_not_available_in_composer() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.update(Action::Key(key(KeyCode::Char('?'))));
+        assert!(
+            app.popup.is_none(),
+            "? should type into composer, not open help"
+        );
+    }
+
+    // ── Paste ───────────────────────────────────────────────────────
+
+    #[test]
+    fn paste_multiline_into_composer() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.update(Action::Paste("line1\nline2\nline3".into()));
+        assert_eq!(app.composer.value, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn paste_into_search() {
+        let mut app = app_on_main();
+        app.screen = Screen::UserSearch;
+        app.update(Action::Paste("npub1abc".into()));
+        assert_eq!(app.search_input.value, "npub1abc");
+    }
+
+    #[test]
+    fn paste_ignored_when_not_in_input() {
+        let mut app = app_on_main();
+        app.focus = Panel::ChatList;
+        app.update(Action::Paste("should be ignored".into()));
+        assert!(app.composer.is_empty());
     }
 }

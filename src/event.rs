@@ -9,6 +9,7 @@ use crate::action::Action;
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
+    Paste(String),
     Tick,
     #[allow(dead_code)]
     Resize(u16, u16),
@@ -33,6 +34,7 @@ impl EventLoop {
             while let Some(Ok(evt)) = reader.next().await {
                 let event = match evt {
                     CrosstermEvent::Key(key) => Event::Key(key),
+                    CrosstermEvent::Paste(text) => Event::Paste(text),
                     CrosstermEvent::Resize(w, h) => Event::Resize(w, h),
                     _ => continue,
                 };
@@ -76,6 +78,7 @@ impl EventLoop {
 pub fn map_event(event: &Event) -> Option<Action> {
     match event {
         Event::Key(key) => map_key_event(key),
+        Event::Paste(text) => Some(Action::Paste(text.clone())),
         Event::Tick => Some(Action::Tick),
         Event::Resize(_, _) => Some(Action::Render),
         Event::Action(action) => Some(action.clone()),

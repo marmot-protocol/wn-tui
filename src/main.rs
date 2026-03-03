@@ -310,11 +310,16 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                             format!("Messages stream connected (group: {group_id})"),
                         );
                         drop(child);
+                        let gid = group_id.clone();
                         while let Some(val) = rx.recv().await {
                             // Messages come as {"result": {"message": {...}, "trigger": "..."}}
                             let msg = val.get("result").and_then(|r| r.get("message")).cloned();
-                            if let Some(msg) = msg {
-                                if tx.send(Event::Action(Action::MessageUpdate(msg))).is_err() {
+                            if let Some(message) = msg {
+                                let action = Action::MessageUpdate {
+                                    group_id: gid.clone(),
+                                    message,
+                                };
+                                if tx.send(Event::Action(action)).is_err() {
                                     break;
                                 }
                             }

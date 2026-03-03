@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Paragraph, Widget, Wrap},
 };
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 /// Extract display name from a message JSON value.
 fn author_name(msg: &Value) -> &str {
@@ -43,6 +44,117 @@ fn timestamp(msg: &Value) -> String {
         return ts.chars().take(5).collect();
     }
     String::new()
+}
+
+/// Estimate how many terminal rows a line of text will occupy at a given width.
+fn wrapped_line_count(text_width: usize, available_width: usize) -> usize {
+    if available_width == 0 || text_width == 0 {
+        return 1;
+    }
+    text_width.div_ceil(available_width)
+}
+
+/// Format reaction summary from `reactions.by_emoji` as a compact line.
+/// Returns `None` if no reactions exist.
+fn format_reactions(msg: &Value, indent: usize) -> Option<Line<'static>> {
+    let by_emoji = msg.get("reactions")?.get("by_emoji")?.as_object()?;
+    if by_emoji.is_empty() {
+        return None;
+    }
+
+    let mut spans = vec![Span::raw(" ".repeat(indent))];
+    for (i, (_key, reaction)) in by_emoji.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let emoji = reaction
+            .get("emoji")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let count = reaction.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        spans.push(Span::styled(
+            format!("{emoji} {count}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
+/// Build the display lines for a message.
+/// All messages use the same layout: `[HH:MM] author: content`
+/// Own messages are distinguished by green author color.
+fn format_message(msg: &Value, my_pubkey: Option<&str>) -> Vec<Line<'static>> {
+    let ts = timestamp(msg);
+    let author = author_name(msg);
+    let text = content(msg);
+    let is_mine = my_pubkey.is_some_and(|pk| author_pubkey(msg) == pk);
+
+    let author_style = if is_mine {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let prefix = format!("[{ts}] ");
+    let author_prefix = format!("{author}: ");
+    let indent = prefix.len() + author_prefix.len();
+    let content_lines: Vec<&str> = text.split('\n').collect();
+
+    let mut lines = Vec::new();
+    for (i, line_text) in content_lines.iter().enumerate() {
+        if i == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(author_prefix.clone(), author_style),
+                Span::raw(line_text.to_string()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::raw(line_text.to_string()),
+            ]));
+        }
+    }
+
+    if let Some(reaction_line) = format_reactions(msg, indent) {
+        lines.push(reaction_line);
+    }
+
+    lines
+}
+
+/// Check whether a message has any reactions.
+fn has_reactions(msg: &Value) -> bool {
+    msg.get("reactions")
+        .and_then(|r| r.get("by_emoji"))
+        .and_then(|b| b.as_object())
+        .is_some_and(|m| !m.is_empty())
+}
+
+/// Estimate the rendered height of a message at a given terminal width.
+/// Accounts for explicit newlines, line wrapping, and a reaction line if present.
+fn message_height(msg: &Value, width: usize) -> usize {
+    let ts = timestamp(msg);
+    let author = author_name(msg);
+    let text = content(msg);
+
+    let prefix_width = format!("[{ts}] ").width() + format!("{author}: ").width();
+    let content_lines: Vec<&str> = text.split('\n').collect();
+
+    let mut total_rows = 0;
+    for line_text in &content_lines {
+        total_rows += wrapped_line_count(prefix_width + line_text.width(), width);
+    }
+
+    if has_reactions(msg) {
+        total_rows += 1;
+    }
+
+    total_rows.max(1)
 }
 
 /// Renders the message list.
@@ -100,52 +212,41 @@ impl Widget for MessageListWidget<'_> {
         let visible_height = inner.height as usize;
         let width = inner.width as usize;
 
-        // Calculate which messages to show
+        // Walk backwards from the end to find which messages fit in the viewport,
+        // accounting for wrapped line heights and scroll offset.
         let total = self.messages.len();
-        let end = total.saturating_sub(self.scroll_from_bottom);
-        let start = end.saturating_sub(visible_height);
-        let visible = &self.messages[start..end];
+        let skip_messages = self.scroll_from_bottom.min(total);
 
-        for (i, msg) in visible.iter().enumerate() {
-            let row = inner.y + i as u16;
-            if row >= inner.y + inner.height {
+        // Collect messages that fit in the visible area, walking from bottom to top
+        let mut visible_msgs: Vec<usize> = Vec::new(); // indices into self.messages
+        let mut used_rows = 0;
+
+        let end = total.saturating_sub(skip_messages);
+        for i in (0..end).rev() {
+            let h = message_height(&self.messages[i], width);
+            if used_rows + h > visible_height {
                 break;
             }
+            used_rows += h;
+            visible_msgs.push(i);
+        }
+        visible_msgs.reverse();
 
-            let ts = timestamp(msg);
-            let author = author_name(msg);
-            let text = content(msg);
-            let is_mine = self.my_pubkey.is_some_and(|pk| author_pubkey(msg) == pk);
+        // Render each visible message
+        let mut y = inner.y;
+        for &idx in &visible_msgs {
+            let msg = &self.messages[idx];
+            let lines = format_message(msg, self.my_pubkey);
+            let h = message_height(msg, width);
 
-            if is_mine {
-                // Right-aligned: content then timestamp
-                let formatted = format!("{text}  [{ts}]");
-                let padding = width.saturating_sub(formatted.len());
-                let line = Line::from(vec![
-                    Span::raw(" ".repeat(padding)),
-                    Span::styled(text.to_string(), Style::default().fg(Color::Green)),
-                    Span::styled(format!("  [{ts}]"), Style::default().fg(Color::DarkGray)),
-                ]);
-                let area = Rect::new(inner.x, row, inner.width, 1);
-                Paragraph::new(line)
-                    .wrap(Wrap { trim: false })
-                    .render(area, buf);
-            } else {
-                // Left-aligned: timestamp, author, content
-                let line = Line::from(vec![
-                    Span::styled(format!("[{ts}] "), Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{author}: "),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text.to_string()),
-                ]);
-                let area = Rect::new(inner.x, row, inner.width, 1);
-                Paragraph::new(line)
-                    .wrap(Wrap { trim: false })
-                    .render(area, buf);
+            let msg_area = Rect::new(inner.x, y, inner.width, h as u16);
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .render(msg_area, buf);
+
+            y += h as u16;
+            if y >= inner.y + inner.height {
+                break;
             }
         }
     }
@@ -201,5 +302,162 @@ mod tests {
         let my_pk = "abc123";
         let msg = json!({"author": "abc123", "content": "hello"});
         assert_eq!(author_pubkey(&msg), my_pk);
+    }
+
+    #[test]
+    fn wrapped_line_count_single_line() {
+        assert_eq!(wrapped_line_count(10, 80), 1);
+        assert_eq!(wrapped_line_count(80, 80), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_multi_line() {
+        assert_eq!(wrapped_line_count(160, 80), 2);
+        assert_eq!(wrapped_line_count(161, 80), 3);
+        assert_eq!(wrapped_line_count(240, 80), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_edge_cases() {
+        assert_eq!(wrapped_line_count(0, 80), 1);
+        assert_eq!(wrapped_line_count(10, 0), 1);
+    }
+
+    #[test]
+    fn message_height_short_message() {
+        let msg =
+            json!({"content": "hi", "author": "a", "created_at_local": "2026-01-01 10:00:00"});
+        // "[10:00] a: hi" is well under 80 chars
+        assert_eq!(message_height(&msg, 80), 1);
+    }
+
+    #[test]
+    fn message_height_long_message() {
+        let long_text = "a".repeat(200);
+        let msg = json!({"content": long_text, "author": "alice", "created_at_local": "2026-01-01 10:00:00"});
+        // "[10:00] alice: " (15 chars) + 200 chars = 215 chars at width 80 = 3 lines
+        let h = message_height(&msg, 80);
+        assert!(h > 1, "Expected multi-line height, got {h}");
+    }
+
+    #[test]
+    fn message_height_with_newlines() {
+        let msg = json!({
+            "content": "line1\nline2\nline3",
+            "author": "alice",
+            "created_at_local": "2026-01-01 10:00:00"
+        });
+        let h = message_height(&msg, 80);
+        assert_eq!(h, 3, "3 lines of short text should be 3 rows");
+    }
+
+    #[test]
+    fn message_height_newline_plus_wrapping() {
+        let long_line = "x".repeat(100);
+        let msg = json!({
+            "content": format!("short\n{long_line}"),
+            "author": "a",
+            "created_at_local": "2026-01-01 10:00:00"
+        });
+        let h = message_height(&msg, 80);
+        // First line: "[10:00] a: short" = 1 row
+        // Second line: indent (13) + 100 chars = 113 chars at width 80 = 2 rows
+        assert!(h >= 3, "Expected at least 3 rows, got {h}");
+    }
+
+    #[test]
+    fn format_message_multiline() {
+        let msg = json!({
+            "content": "hello\nworld",
+            "author": "alice",
+            "created_at_local": "2026-01-01 10:00:00"
+        });
+        let lines = format_message(&msg, None);
+        assert_eq!(lines.len(), 2, "Should produce 2 Line entries");
+    }
+
+    #[test]
+    fn format_reactions_empty() {
+        let msg =
+            json!({"content": "hi", "author": "a", "created_at_local": "2026-01-01 10:00:00"});
+        let lines = format_message(&msg, None);
+        assert_eq!(lines.len(), 1, "No reactions = no extra line");
+    }
+
+    #[test]
+    fn format_reactions_single_emoji() {
+        let msg = json!({
+            "content": "hi",
+            "author": "a",
+            "created_at_local": "2026-01-01 10:00:00",
+            "reactions": {
+                "by_emoji": {
+                    "👍": { "emoji": "👍", "count": 3 }
+                }
+            }
+        });
+        let lines = format_message(&msg, None);
+        assert_eq!(lines.len(), 2, "Should have content + reaction line");
+        let reaction_text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(reaction_text.contains("👍"), "Should contain the emoji");
+        assert!(reaction_text.contains("3"), "Should contain the count");
+    }
+
+    #[test]
+    fn format_reactions_multiple_emojis() {
+        let msg = json!({
+            "content": "great",
+            "author": "a",
+            "created_at_local": "2026-01-01 10:00:00",
+            "reactions": {
+                "by_emoji": {
+                    "👍": { "emoji": "👍", "count": 2 },
+                    "❤": { "emoji": "❤", "count": 1 },
+                    "🎉": { "emoji": "🎉", "count": 5 }
+                }
+            }
+        });
+        let lines = format_message(&msg, None);
+        assert_eq!(lines.len(), 2);
+        let reaction_text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(reaction_text.contains("👍"));
+        assert!(reaction_text.contains("❤"));
+        assert!(reaction_text.contains("🎉"));
+    }
+
+    #[test]
+    fn message_height_includes_reactions() {
+        let msg = json!({
+            "content": "hi",
+            "author": "a",
+            "created_at_local": "2026-01-01 10:00:00",
+            "reactions": {
+                "by_emoji": {
+                    "👍": { "emoji": "👍", "count": 1 }
+                }
+            }
+        });
+        assert_eq!(message_height(&msg, 80), 2, "1 content + 1 reaction");
+    }
+
+    #[test]
+    fn message_height_no_reactions() {
+        let msg =
+            json!({"content": "hi", "author": "a", "created_at_local": "2026-01-01 10:00:00"});
+        assert_eq!(message_height(&msg, 80), 1);
+    }
+
+    #[test]
+    fn format_message_own_same_layout() {
+        let msg = json!({
+            "content": "hello",
+            "author": "me",
+            "created_at_local": "2026-01-01 10:00:00"
+        });
+        let lines = format_message(&msg, Some("me"));
+        // Own messages use same layout: [HH:MM] author: content
+        assert_eq!(lines.len(), 1);
+        // First span is timestamp, second is author, third is content
+        assert_eq!(lines[0].spans.len(), 3);
     }
 }

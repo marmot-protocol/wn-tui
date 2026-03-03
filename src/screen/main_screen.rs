@@ -64,9 +64,18 @@ fn draw_chat_list(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(widget, area);
 }
 
+/// Maximum total rows for the composer (including borders).
+const MAX_COMPOSER_HEIGHT: u16 = 8;
+
 fn draw_message_panel(app: &App, frame: &mut Frame, area: Rect) {
-    // Vertical: messages + composer
-    let vertical = Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).split(area);
+    // Calculate dynamic composer height based on content.
+    // inner_width = total width minus 2 border columns
+    let inner_width = area.width.saturating_sub(2);
+    let content_lines = app.composer.line_count(inner_width);
+    let composer_height = (content_lines + 2).clamp(3, MAX_COMPOSER_HEIGHT); // +2 for borders
+
+    let vertical =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(composer_height)]).split(area);
 
     let messages_area = vertical[0];
     let composer_area = vertical[1];
@@ -283,8 +292,15 @@ fn draw_log_panel(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_status_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let display_name = app.profile.as_ref().and_then(|p| {
+        p.get("name")
+            .or_else(|| p.get("display_name"))
+            .and_then(|v| v.as_str())
+    });
     let widget = StatusBarWidget::new(app.account.as_deref(), app.chats.len())
+        .display_name(display_name)
         .unread_total(app.total_unread())
+        .pending_invites(app.pending_invites())
         .connected(app.connected);
     frame.render_widget(widget, area);
 }

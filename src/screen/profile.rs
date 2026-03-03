@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{hex_to_npub, App};
 
 /// Extract a profile field with fallback keys.
 fn field(profile: &serde_json::Value, keys: &[&str]) -> String {
@@ -55,6 +55,13 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
     let name = field(profile, &["name", "display_name"]);
     let about = field(profile, &["about"]);
     let npub = field(profile, &["npub"]);
+    let npub = if npub.is_empty() {
+        app.account.as_deref().map(hex_to_npub).unwrap_or_default()
+    } else if !npub.starts_with("npub") {
+        hex_to_npub(&npub)
+    } else {
+        npub
+    };
 
     let lines = vec![
         Line::raw(""),
@@ -82,7 +89,7 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from(vec![
             Span::styled("  npub:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(npub, Style::default().fg(Color::DarkGray)),
+            Span::styled(npub, Style::default().fg(Color::White)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), vertical[0]);

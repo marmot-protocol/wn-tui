@@ -8,6 +8,7 @@ pub enum Action {
     Quit,
     Render,
     Key(KeyEvent),
+    Paste(String),
 
     // Login flow
     AccountsLoaded(Vec<Value>),
@@ -19,7 +20,10 @@ pub enum Action {
     ChatStreamEnded,
 
     // Messages (streaming)
-    MessageUpdate(Value),
+    MessageUpdate {
+        group_id: String,
+        message: Value,
+    },
     MessageStreamEnded,
 
     // Send message
