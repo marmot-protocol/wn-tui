@@ -54,6 +54,11 @@ pub enum Action {
     SettingsUpdateSuccess(String),
     SettingsUpdateError(String),
 
+    // Follows
+    FollowsLoaded(Vec<Value>),
+    FollowSuccess(String),
+    FollowError(String),
+
     // User search
     SearchResult(Value),
     SearchStreamEnded,
@@ -151,6 +156,19 @@ pub enum Effect {
         account: String,
         key: String,
         value: String,
+    },
+
+    // Follows
+    LoadFollows {
+        account: String,
+    },
+    FollowUser {
+        account: String,
+        pubkey: String,
+    },
+    UnfollowUser {
+        account: String,
+        pubkey: String,
     },
 
     // User search

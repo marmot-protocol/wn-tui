@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget},
     Frame,
 };
 
@@ -46,8 +46,9 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
 
     let vertical = Layout::vertical([
         Constraint::Length(7), // Profile info
-        Constraint::Fill(1),   // spacer
-        Constraint::Length(2), // Hints
+        Constraint::Length(1), // Follows header
+        Constraint::Fill(1),   // Follows list
+        Constraint::Length(1), // Hints
     ])
     .split(inner);
 
@@ -94,20 +95,84 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
     ];
     frame.render_widget(Paragraph::new(lines), vertical[0]);
 
-    // Hints
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(vertical[2]);
+    // Follows header
+    let follows_header = Line::from(vec![Span::styled(
+        format!("  Following ({})", app.follows.len()),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    frame.render_widget(Paragraph::new(follows_header), vertical[1]);
 
-    let line1 = Line::from(vec![
+    // Follows list
+    if app.follows.is_empty() {
+        let empty = Paragraph::new(Span::styled(
+            "  Not following anyone",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(empty, vertical[2]);
+    } else {
+        let items: Vec<ListItem> = app
+            .follows
+            .iter()
+            .enumerate()
+            .map(|(i, user)| {
+                let name = user
+                    .get("metadata")
+                    .and_then(|m| m.get("display_name").or_else(|| m.get("name")))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        user.get("display_name")
+                            .or_else(|| user.get("name"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .unwrap_or("unknown");
+                let pk = user.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");
+                let short = if pk.len() > 16 {
+                    format!("{}...{}", &pk[..8], &pk[pk.len() - 6..])
+                } else {
+                    pk.to_string()
+                };
+                let marker = if i == app.selected_follow { ">" } else { " " };
+                let style = if i == app.selected_follow {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {marker} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(name.to_string(), style),
+                    Span::styled(format!("  {short}"), Style::default().fg(Color::DarkGray)),
+                ]))
+            })
+            .collect();
+
+        let list = List::new(items);
+        let mut state = ListState::default();
+        state.select(Some(app.selected_follow));
+        StatefulWidget::render(list, vertical[2], frame.buffer_mut(), &mut state);
+    }
+
+    // Hints
+    let mut hints = vec![
         Span::styled("  [n] ", Style::default().fg(Color::Cyan)),
         Span::raw("Edit name  "),
         Span::styled("[a] ", Style::default().fg(Color::Cyan)),
         Span::raw("Edit about  "),
-    ]);
-    frame.render_widget(Paragraph::new(line1), rows[0]);
-
-    let line2 = Line::from(vec![
-        Span::styled("  [Esc] ", Style::default().fg(Color::Cyan)),
+    ];
+    if !app.follows.is_empty() {
+        hints.extend([
+            Span::styled("[j/k] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Navigate  "),
+            Span::styled("[d] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Unfollow  "),
+        ]);
+    }
+    hints.extend([
+        Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
         Span::raw("Back"),
     ]);
-    frame.render_widget(Paragraph::new(line2), rows[1]);
+    frame.render_widget(Paragraph::new(Line::from(hints)), vertical[3]);
 }

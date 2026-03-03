@@ -116,6 +116,10 @@ pub struct App {
     #[allow(dead_code)]
     pub selected_setting: usize,
 
+    // Follows
+    pub follows: Vec<Value>,
+    pub selected_follow: usize,
+
     // User search
     pub search_input: Input,
     pub search_results: Vec<Value>,
@@ -161,6 +165,8 @@ impl App {
             profile: None,
             settings_data: None,
             selected_setting: 0,
+            follows: Vec::new(),
+            selected_follow: 0,
             search_input: Input::new(),
             search_results: Vec::new(),
             selected_result: 0,
@@ -319,6 +325,25 @@ impl App {
                 });
             }
 
+            // Follows
+            Action::FollowsLoaded(list) => {
+                self.follows = list;
+                if self.selected_follow >= self.follows.len() {
+                    self.selected_follow = self.follows.len().saturating_sub(1);
+                }
+            }
+            Action::FollowSuccess(_msg) => {
+                // Reload follows list to stay in sync
+                if let Some(account) = &self.account {
+                    return vec![Effect::LoadFollows {
+                        account: account.clone(),
+                    }];
+                }
+            }
+            Action::FollowError(msg) => {
+                self.popup = Some(Popup::Error { message: msg });
+            }
+
             // User search
             Action::SearchResult(val) => {
                 self.search_results.push(val);
@@ -387,10 +412,12 @@ impl App {
         self.connected = false;
         self.popup = None;
         let acct = account.clone();
+        let acct2 = acct.clone();
         vec![
             Effect::SubscribeNotifications,
             Effect::SubscribeChats { account },
             Effect::LoadProfile { account: acct },
+            Effect::LoadFollows { account: acct2 },
             Effect::TailDaemonLog,
         ]
     }
@@ -406,6 +433,13 @@ impl App {
             .iter()
             .filter(|c| c.get("pending_confirmation").and_then(|v| v.as_bool()) == Some(true))
             .count()
+    }
+
+    /// Check if a pubkey is in the follows list.
+    pub fn is_following(&self, pubkey: &str) -> bool {
+        self.follows
+            .iter()
+            .any(|f| f.get("pubkey").and_then(|v| v.as_str()) == Some(pubkey))
     }
 
     fn handle_accounts_loaded(&mut self, accounts: Vec<Value>) -> Vec<Effect> {
@@ -797,7 +831,12 @@ impl App {
                 };
                 self.screen = Screen::Profile;
                 self.profile = None;
-                vec![Effect::LoadProfile { account }]
+                self.selected_follow = 0;
+                let acct = account.clone();
+                vec![
+                    Effect::LoadProfile { account },
+                    Effect::LoadFollows { account: acct },
+                ]
             }
             KeyCode::Char('S') => {
                 let account = match &self.account {
@@ -1135,6 +1174,35 @@ impl App {
                 }
                 vec![]
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.follows.is_empty() {
+                    self.selected_follow = (self.selected_follow + 1).min(self.follows.len() - 1);
+                }
+                vec![]
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected_follow = self.selected_follow.saturating_sub(1);
+                vec![]
+            }
+            KeyCode::Char('d') => {
+                // Unfollow selected
+                let account = match &self.account {
+                    Some(a) => a.clone(),
+                    None => return vec![],
+                };
+                let pubkey = self
+                    .follows
+                    .get(self.selected_follow)
+                    .and_then(|f| f.get("pubkey").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string());
+                match pubkey {
+                    Some(pk) => vec![Effect::UnfollowUser {
+                        account,
+                        pubkey: pk,
+                    }],
+                    None => vec![],
+                }
+            }
             _ => vec![],
         }
     }
@@ -1226,6 +1294,7 @@ impl App {
                 self.selected_result = self.selected_result.saturating_sub(1);
                 vec![]
             }
+            KeyCode::Tab => self.toggle_follow_selected(),
             KeyCode::Char(ch) => {
                 self.search_input.insert(ch);
                 vec![]
@@ -1255,6 +1324,31 @@ impl App {
                 vec![]
             }
             _ => vec![],
+        }
+    }
+
+    fn toggle_follow_selected(&mut self) -> Vec<Effect> {
+        let account = match &self.account {
+            Some(a) => a.clone(),
+            None => return vec![],
+        };
+        let pubkey = self
+            .search_results
+            .get(self.selected_result)
+            .and_then(|u| {
+                u.get("pubkey")
+                    .or_else(|| u.get("npub"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.to_string());
+        let Some(pubkey) = pubkey else {
+            return vec![];
+        };
+
+        if self.is_following(&pubkey) {
+            vec![Effect::UnfollowUser { account, pubkey }]
+        } else {
+            vec![Effect::FollowUser { account, pubkey }]
         }
     }
 
@@ -2305,6 +2399,125 @@ mod tests {
         assert!(effects
             .iter()
             .any(|e| matches!(e, Effect::UnsubscribeSearch)));
+    }
+
+    // ── Follows ───────────────────────────────────────────────────────
+
+    #[test]
+    fn follows_loaded_populates_list() {
+        let mut app = app_on_main();
+        app.update(Action::FollowsLoaded(vec![
+            json!({"pubkey": "abc"}),
+            json!({"pubkey": "def"}),
+        ]));
+        assert_eq!(app.follows.len(), 2);
+        assert!(app.is_following("abc"));
+        assert!(app.is_following("def"));
+    }
+
+    #[test]
+    fn follows_loaded_replaces_previous() {
+        let mut app = app_on_main();
+        app.follows = vec![json!({"pubkey": "old"})];
+        app.update(Action::FollowsLoaded(vec![json!({"pubkey": "new"})]));
+        assert_eq!(app.follows.len(), 1);
+        assert!(app.is_following("new"));
+        assert!(!app.is_following("old"));
+    }
+
+    #[test]
+    fn follow_success_reloads_follows() {
+        let mut app = app_on_main();
+        let effects = app.update(Action::FollowSuccess("Followed abc".into()));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadFollows { .. })));
+    }
+
+    #[test]
+    fn follow_error_shows_popup() {
+        let mut app = app_on_main();
+        app.update(Action::FollowError("Network error".into()));
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
+    }
+
+    #[test]
+    fn login_loads_follows() {
+        let mut app = App::new();
+        let effects = app.update(Action::LoginSuccess("npub1xyz".into()));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadFollows { .. })));
+    }
+
+    #[test]
+    fn profile_loads_follows() {
+        let mut app = app_on_main();
+        let effects = app.update(Action::Key(key(KeyCode::Char('p'))));
+        assert_eq!(app.screen, Screen::Profile);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadFollows { .. })));
+    }
+
+    #[test]
+    fn profile_j_navigates_follows() {
+        let mut app = app_on_main();
+        app.screen = Screen::Profile;
+        app.follows = vec![
+            json!({"pubkey": "a", "name": "Alice"}),
+            json!({"pubkey": "b", "name": "Bob"}),
+        ];
+        app.update(Action::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.selected_follow, 1);
+    }
+
+    #[test]
+    fn profile_d_unfollows_selected() {
+        let mut app = app_on_main();
+        app.screen = Screen::Profile;
+        app.follows = vec![
+            json!({"pubkey": "abc", "name": "Alice"}),
+            json!({"pubkey": "def", "name": "Bob"}),
+        ];
+        app.selected_follow = 1;
+        let effects = app.update(Action::Key(key(KeyCode::Char('d'))));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::UnfollowUser { ref pubkey, .. } if pubkey == "def")));
+    }
+
+    #[test]
+    fn follows_selected_clamped_after_reload() {
+        let mut app = app_on_main();
+        app.selected_follow = 5;
+        app.update(Action::FollowsLoaded(vec![json!({"pubkey": "a"})]));
+        assert_eq!(app.selected_follow, 0);
+    }
+
+    #[test]
+    fn search_tab_follows_user() {
+        let mut app = app_on_main();
+        app.screen = Screen::UserSearch;
+        app.search_results = vec![json!({"pubkey": "abc123", "name": "Alice"})];
+        app.selected_result = 0;
+        let effects = app.update(Action::Key(key(KeyCode::Tab)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::FollowUser { ref pubkey, .. } if pubkey == "abc123")));
+    }
+
+    #[test]
+    fn search_tab_unfollows_if_already_following() {
+        let mut app = app_on_main();
+        app.screen = Screen::UserSearch;
+        app.search_results = vec![json!({"pubkey": "abc123", "name": "Alice"})];
+        app.selected_result = 0;
+        app.follows = vec![json!({"pubkey": "abc123"})];
+        let effects = app.update(Action::Key(key(KeyCode::Tab)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::UnfollowUser { ref pubkey, .. } if pubkey == "abc123")));
     }
 
     // ── Help overlay ──────────────────────────────────────────────────

@@ -163,6 +163,9 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::UpdateProfile { .. } => "UpdateProfile",
         Effect::LoadSettings { .. } => "LoadSettings",
         Effect::UpdateSetting { .. } => "UpdateSetting",
+        Effect::LoadFollows { .. } => "LoadFollows",
+        Effect::FollowUser { .. } => "FollowUser",
+        Effect::UnfollowUser { .. } => "UnfollowUser",
         Effect::SearchUsers { .. } => "SearchUsers",
         Effect::UnsubscribeSearch => "UnsubscribeSearch",
         Effect::TailDaemonLog => "TailDaemonLog",
@@ -591,6 +594,48 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                     match wn::exec(&["--account", &account, "settings", &key, &value]).await {
                         Ok(_) => Action::SettingsUpdateSuccess(format!("{key} updated")),
                         Err(e) => Action::SettingsUpdateError(e.to_string()),
+                    };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::LoadFollows { account } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&["--account", &account, "follows", "list"]).await {
+                    Ok(val) => {
+                        let list = match val {
+                            serde_json::Value::Array(arr) => arr,
+                            serde_json::Value::Null => vec![],
+                            other => vec![other],
+                        };
+                        Action::FollowsLoaded(list)
+                    }
+                    Err(e) => Action::FollowError(format!("Load follows: {e}")),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::FollowUser { account, pubkey } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action =
+                    match wn::exec(&["--account", &account, "follows", "add", &pubkey]).await {
+                        Ok(_) => Action::FollowSuccess(format!("Followed {}", &pubkey)),
+                        Err(e) => Action::FollowError(format!("Follow failed: {e}")),
+                    };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::UnfollowUser { account, pubkey } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action =
+                    match wn::exec(&["--account", &account, "follows", "remove", &pubkey]).await {
+                        Ok(_) => Action::FollowSuccess(format!("Unfollowed {}", &pubkey)),
+                        Err(e) => Action::FollowError(format!("Unfollow failed: {e}")),
                     };
                 let _ = tx.send(Event::Action(action));
             });
