@@ -167,6 +167,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::LoadFollows { .. } => "LoadFollows",
         Effect::FollowUser { .. } => "FollowUser",
         Effect::UnfollowUser { .. } => "UnfollowUser",
+        Effect::CheckFollow { .. } => "CheckFollow",
         Effect::SearchUsers { .. } => "SearchUsers",
         Effect::UnsubscribeSearch => "UnsubscribeSearch",
         Effect::TailDaemonLog => "TailDaemonLog",
@@ -584,7 +585,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                             .unwrap_or_else(|| val.to_string());
                         Action::NsecExported(nsec)
                     }
-                    Err(e) => Action::ProfileUpdateError(e.to_string()),
+                    Err(e) => Action::NsecExportError(e.to_string()),
                 };
                 let _ = tx.send(Event::Action(action));
             });
@@ -656,6 +657,24 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                         Err(e) => Action::FollowError(format!("Unfollow failed: {e}")),
                     };
                 let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::CheckFollow { account, pubkey } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let following =
+                    match wn::exec(&["--account", &account, "follows", "check", &pubkey]).await {
+                        Ok(val) => val
+                            .get("following")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                let _ = tx.send(Event::Action(Action::FollowCheckResult {
+                    pubkey,
+                    following,
+                }));
             });
         }
 

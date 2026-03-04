@@ -129,6 +129,7 @@ pub struct App {
     pub search_results: Vec<Value>,
     pub selected_result: usize,
     pub search_purpose: SearchPurpose,
+    pub follow_checks: HashMap<String, bool>,
 
     // Log panel
     pub show_logs: bool,
@@ -175,6 +176,7 @@ impl App {
             search_results: Vec::new(),
             selected_result: 0,
             search_purpose: SearchPurpose::Browse,
+            follow_checks: HashMap::new(),
             show_logs: false,
             logs: Vec::new(),
             daemon_logs: Vec::new(),
@@ -312,8 +314,13 @@ impl App {
             }
             Action::NsecExported(nsec) => {
                 self.popup = Some(Popup::Info {
-                    title: "Export nsec".into(),
+                    title: "Show nsec".into(),
                     message: nsec,
+                });
+            }
+            Action::NsecExportError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Export nsec failed: {msg}"),
                 });
             }
 
@@ -353,10 +360,26 @@ impl App {
             Action::FollowError(msg) => {
                 self.popup = Some(Popup::Error { message: msg });
             }
+            Action::FollowCheckResult { pubkey, following } => {
+                self.follow_checks.insert(pubkey, following);
+            }
 
             // User search
             Action::SearchResult(val) => {
+                let pubkey = val
+                    .get("pubkey")
+                    .or_else(|| val.get("npub"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 self.search_results.push(val);
+                if let (Some(pk), Some(account)) = (pubkey, &self.account) {
+                    if !self.follow_checks.contains_key(&pk) {
+                        return vec![Effect::CheckFollow {
+                            account: account.clone(),
+                            pubkey: pk,
+                        }];
+                    }
+                }
             }
             Action::SearchStreamEnded => {}
 
@@ -445,8 +468,17 @@ impl App {
             .count()
     }
 
-    /// Check if a pubkey is in the follows list.
+    fn clear_search_results(&mut self) {
+        self.search_results.clear();
+        self.follow_checks.clear();
+        self.selected_result = 0;
+    }
+
+    /// Check if a pubkey is followed. Uses authoritative check cache first, falls back to local list.
     pub fn is_following(&self, pubkey: &str) -> bool {
+        if let Some(&checked) = self.follow_checks.get(pubkey) {
+            return checked;
+        }
         self.follows
             .iter()
             .any(|f| f.get("pubkey").and_then(|v| v.as_str()) == Some(pubkey))
@@ -860,8 +892,7 @@ impl App {
             KeyCode::Char('/') => {
                 self.screen = Screen::UserSearch;
                 self.search_input.clear();
-                self.search_results.clear();
-                self.selected_result = 0;
+                self.clear_search_results();
                 self.search_purpose = SearchPurpose::Browse;
                 vec![]
             }
@@ -1052,8 +1083,7 @@ impl App {
                 };
                 self.screen = Screen::UserSearch;
                 self.search_input.clear();
-                self.search_results.clear();
-                self.selected_result = 0;
+                self.clear_search_results();
                 self.search_purpose = SearchPurpose::AddMember { group_id };
                 vec![]
             }
@@ -1248,8 +1278,7 @@ impl App {
                 };
                 self.screen = back_screen;
                 self.search_input.clear();
-                self.search_results.clear();
-                self.selected_result = 0;
+                self.clear_search_results();
                 vec![Effect::UnsubscribeSearch]
             }
             KeyCode::Enter => {
@@ -1273,8 +1302,7 @@ impl App {
                         // Go back to group detail
                         self.screen = Screen::GroupDetail;
                         self.search_input.clear();
-                        self.search_results.clear();
-                        self.selected_result = 0;
+                        self.clear_search_results();
                         return vec![
                             Effect::UnsubscribeSearch,
                             Effect::AddMember {
@@ -1293,8 +1321,7 @@ impl App {
                         None => return vec![],
                     };
                     let query = self.search_input.value.clone();
-                    self.search_results.clear();
-                    self.selected_result = 0;
+                    self.clear_search_results();
                     vec![Effect::SearchUsers { account, query }]
                 } else {
                     vec![]
@@ -1363,8 +1390,10 @@ impl App {
         };
 
         if self.is_following(&pubkey) {
+            self.follow_checks.insert(pubkey.clone(), false);
             vec![Effect::UnfollowUser { account, pubkey }]
         } else {
+            self.follow_checks.insert(pubkey.clone(), true);
             vec![Effect::FollowUser { account, pubkey }]
         }
     }

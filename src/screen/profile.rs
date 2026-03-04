@@ -162,7 +162,7 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled("[a] ", Style::default().fg(Color::Cyan)),
         Span::raw("Edit about  "),
         Span::styled("[e] ", Style::default().fg(Color::Cyan)),
-        Span::raw("Export nsec  "),
+        Span::raw("Show nsec  "),
     ];
     if !app.follows.is_empty() {
         hints.extend([

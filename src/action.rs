@@ -49,6 +49,7 @@ pub enum Action {
     ProfileUpdateSuccess(String),
     ProfileUpdateError(String),
     NsecExported(String),
+    NsecExportError(String),
 
     // Settings
     SettingsLoaded(Value),
@@ -59,6 +60,7 @@ pub enum Action {
     FollowsLoaded(Vec<Value>),
     FollowSuccess(String),
     FollowError(String),
+    FollowCheckResult { pubkey: String, following: bool },
 
     // User search
     SearchResult(Value),
@@ -171,6 +173,10 @@ pub enum Effect {
         pubkey: String,
     },
     UnfollowUser {
+        account: String,
+        pubkey: String,
+    },
+    CheckFollow {
         account: String,
         pubkey: String,
     },
