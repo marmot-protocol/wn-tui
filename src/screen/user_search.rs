@@ -69,16 +69,18 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
                             .and_then(|v| v.as_str())
                     })
                     .unwrap_or("unknown");
-                let npub = user
+                let pubkey = user
                     .get("pubkey")
                     .or_else(|| user.get("npub"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let short_npub = if npub.len() > 20 {
-                    format!("{}...", &npub[..17])
+                let short_npub = if pubkey.len() > 20 {
+                    format!("{}...", &pubkey[..17])
                 } else {
-                    npub.to_string()
+                    pubkey.to_string()
                 };
+                let is_following = app.is_following(pubkey);
+                let follow_badge = if is_following { " [following]" } else { "" };
 
                 let marker = if i == app.selected_result { ">" } else { " " };
                 let name_style = if i == app.selected_result {
@@ -96,6 +98,7 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
                         format!("  {short_npub}"),
                         Style::default().fg(Color::DarkGray),
                     ),
+                    Span::styled(follow_badge.to_string(), Style::default().fg(Color::Green)),
                 ]))
             })
             .collect();
@@ -116,6 +119,12 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
         hint_spans.push(Span::raw(select_hint));
     } else {
         hint_spans.push(Span::raw("Search  "));
+    }
+    if !app.search_results.is_empty() {
+        hint_spans.extend([
+            Span::styled("[Tab] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Follow/Unfollow  "),
+        ]);
     }
     hint_spans.extend([
         Span::styled("[↑/↓] ", Style::default().fg(Color::Cyan)),

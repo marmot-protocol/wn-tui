@@ -191,6 +191,37 @@ src/
 | `Enter` | Send message   |
 | `Esc`   | Stop composing |
 
+### Group detail
+
+| Key       | Action              |
+| --------- | ------------------- |
+| `j` / `k` | Navigate members    |
+| `a`       | Search & add member |
+| `A`       | Add by pubkey/npub  |
+| `x`       | Remove member       |
+| `R`       | Rename group        |
+| `L`       | Leave group         |
+| `Esc`     | Back                |
+
+### Profile
+
+| Key       | Action           |
+| --------- | ---------------- |
+| `n`       | Edit name        |
+| `a`       | Edit about       |
+| `j` / `k` | Navigate follows |
+| `d`       | Unfollow         |
+| `Esc`     | Back             |
+
+### User search
+
+| Key       | Action            |
+| --------- | ----------------- |
+| `Enter`   | Search            |
+| `↑` / `↓` | Navigate results  |
+| `Tab`     | Follow / Unfollow |
+| `Esc`     | Back              |
+
 ## License
 
-TBD
+MIT License

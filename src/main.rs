@@ -163,6 +163,9 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::UpdateProfile { .. } => "UpdateProfile",
         Effect::LoadSettings { .. } => "LoadSettings",
         Effect::UpdateSetting { .. } => "UpdateSetting",
+        Effect::LoadFollows { .. } => "LoadFollows",
+        Effect::FollowUser { .. } => "FollowUser",
+        Effect::UnfollowUser { .. } => "UnfollowUser",
         Effect::SearchUsers { .. } => "SearchUsers",
         Effect::UnsubscribeSearch => "UnsubscribeSearch",
         Effect::TailDaemonLog => "TailDaemonLog",
@@ -596,6 +599,48 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
             });
         }
 
+        Effect::LoadFollows { account } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&["--account", &account, "follows", "list"]).await {
+                    Ok(val) => {
+                        let list = match val {
+                            serde_json::Value::Array(arr) => arr,
+                            serde_json::Value::Null => vec![],
+                            other => vec![other],
+                        };
+                        Action::FollowsLoaded(list)
+                    }
+                    Err(e) => Action::FollowError(format!("Load follows: {e}")),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::FollowUser { account, pubkey } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action =
+                    match wn::exec(&["--account", &account, "follows", "add", &pubkey]).await {
+                        Ok(_) => Action::FollowSuccess(format!("Followed {}", &pubkey)),
+                        Err(e) => Action::FollowError(format!("Follow failed: {e}")),
+                    };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::UnfollowUser { account, pubkey } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action =
+                    match wn::exec(&["--account", &account, "follows", "remove", &pubkey]).await {
+                        Ok(_) => Action::FollowSuccess(format!("Unfollowed {}", &pubkey)),
+                        Err(e) => Action::FollowError(format!("Unfollow failed: {e}")),
+                    };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
         Effect::SearchUsers { account, query } => {
             streams.kill_search();
             let tx = tx.clone();
@@ -664,10 +709,10 @@ fn extract_npub_login(val: serde_json::Value) -> Action {
 
 /// Find the daemon log directory based on platform and build mode.
 fn daemon_logs_dir() -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
+    let _home = dirs::home_dir()?;
     // Check both release and dev dirs — daemon build mode may differ from TUI build mode
     #[cfg(target_os = "macos")]
-    let base = home.join("Library").join("Logs").join("whitenoise-cli");
+    let base = _home.join("Library").join("Logs").join("whitenoise-cli");
     #[cfg(not(target_os = "macos"))]
     let base = dirs::data_dir()?.join("whitenoise-cli").join("logs");
     Some(base)
