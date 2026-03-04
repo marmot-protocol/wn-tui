@@ -48,6 +48,7 @@ pub enum Action {
     ProfileLoaded(Value),
     ProfileUpdateSuccess(String),
     ProfileUpdateError(String),
+    NsecExported(String),
 
     // Settings
     SettingsLoaded(Value),
@@ -145,6 +146,9 @@ pub enum Effect {
         account: String,
         name: Option<String>,
         about: Option<String>,
+    },
+    ExportNsec {
+        account: String,
     },
 
     // Settings

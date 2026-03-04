@@ -161,6 +161,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::DeclineInvite { .. } => "DeclineInvite",
         Effect::LoadProfile { .. } => "LoadProfile",
         Effect::UpdateProfile { .. } => "UpdateProfile",
+        Effect::ExportNsec { .. } => "ExportNsec",
         Effect::LoadSettings { .. } => "LoadSettings",
         Effect::UpdateSetting { .. } => "UpdateSetting",
         Effect::LoadFollows { .. } => "LoadFollows",
@@ -566,6 +567,23 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                 }
                 let action = match wn::exec(&args).await {
                     Ok(_) => Action::ProfileUpdateSuccess("Profile updated".into()),
+                    Err(e) => Action::ProfileUpdateError(e.to_string()),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::ExportNsec { account } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&["export-nsec", &account]).await {
+                    Ok(val) => {
+                        let nsec = val
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| val.to_string());
+                        Action::NsecExported(nsec)
+                    }
                     Err(e) => Action::ProfileUpdateError(e.to_string()),
                 };
                 let _ = tx.send(Event::Action(action));

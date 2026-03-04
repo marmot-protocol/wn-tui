@@ -41,6 +41,10 @@ pub enum Popup {
     Error {
         message: String,
     },
+    Info {
+        title: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,6 +308,12 @@ impl App {
             Action::ProfileUpdateError(msg) => {
                 self.popup = Some(Popup::Error {
                     message: format!("Error: {msg}"),
+                });
+            }
+            Action::NsecExported(nsec) => {
+                self.popup = Some(Popup::Info {
+                    title: "Export nsec".into(),
+                    message: nsec,
                 });
             }
 
@@ -637,8 +647,8 @@ impl App {
                 }
                 _ => vec![],
             },
-            Popup::Help { .. } | Popup::Error { .. } => {
-                // Any key dismisses help/error popups
+            Popup::Help { .. } | Popup::Error { .. } | Popup::Info { .. } => {
+                // Any key dismisses help/error/info popups
                 self.popup = None;
                 vec![]
             }
@@ -1174,6 +1184,13 @@ impl App {
                 }
                 vec![]
             }
+            KeyCode::Char('e') => {
+                let account = match &self.account {
+                    Some(a) => a.clone(),
+                    None => return vec![],
+                };
+                vec![Effect::ExportNsec { account }]
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if !self.follows.is_empty() {
                     self.selected_follow = (self.selected_follow + 1).min(self.follows.len() - 1);
@@ -1517,6 +1534,19 @@ impl App {
                     ])
                     .hints(vec![("Esc", "Dismiss")])
                     .size(55, 8);
+                frame.render_widget(widget, area);
+            }
+            Popup::Info { title, message } => {
+                let widget = PopupWidget::new(title)
+                    .body(vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            message.as_str(),
+                            Style::default().fg(Color::Yellow),
+                        )),
+                    ])
+                    .hints(vec![("Any key", "Dismiss")])
+                    .size(70, 8);
                 frame.render_widget(widget, area);
             }
             Popup::Invites { items, selected } => {
