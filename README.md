@@ -193,6 +193,4 @@ src/
 
 ## License
 
-![License](https://blossom.primal.net/76987db82adcb68587ce06ff3bb27122eadc374a6c57663429defd4fa345d4d9.png)
-
 TBD
