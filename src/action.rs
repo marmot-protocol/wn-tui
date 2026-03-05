@@ -46,6 +46,7 @@ pub enum Action {
 
     // Profile
     ProfileLoaded(Value),
+    ProfileImageFetched(Vec<u8>),
     ProfileUpdateSuccess(String),
     ProfileUpdateError(String),
     NsecExported(String),
@@ -60,11 +61,20 @@ pub enum Action {
     FollowsLoaded(Vec<Value>),
     FollowSuccess(String),
     FollowError(String),
-    FollowCheckResult { pubkey: String, following: bool },
+    FollowCheckResult {
+        pubkey: String,
+        following: bool,
+    },
 
     // User search
     SearchResult(Value),
     SearchStreamEnded,
+    UserProfileLoaded(Value),
+    UserProfileError(String),
+
+    // Account management
+    LogoutSuccess,
+    LogoutError(String),
 
     // Logs
     Log(String),
@@ -111,6 +121,7 @@ pub enum Effect {
     CreateGroup {
         account: String,
         name: String,
+        members: Vec<String>,
     },
     AddMember {
         account: String,
@@ -147,10 +158,17 @@ pub enum Effect {
     UpdateProfile {
         account: String,
         name: Option<String>,
+        display_name: Option<String>,
         about: Option<String>,
+        picture: Option<String>,
+        nip05: Option<String>,
+        lud16: Option<String>,
     },
     ExportNsec {
         account: String,
+    },
+    FetchProfileImage {
+        url: String,
     },
 
     // Settings
@@ -187,6 +205,15 @@ pub enum Effect {
         query: String,
     },
     UnsubscribeSearch,
+    ShowUserProfile {
+        account: String,
+        pubkey: String,
+    },
+
+    // Account management
+    Logout {
+        account: String,
+    },
 
     // Daemon logs
     TailDaemonLog,

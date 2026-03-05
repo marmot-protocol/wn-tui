@@ -5,20 +5,20 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget},
     Frame,
 };
+use ratatui_image::StatefulImage;
 
 use crate::app::{hex_to_npub, App};
 
-/// Extract a profile field with fallback keys.
-fn field(profile: &serde_json::Value, keys: &[&str]) -> String {
-    for key in keys {
-        if let Some(s) = profile.get(*key).and_then(|v| v.as_str()) {
-            return s.to_string();
-        }
+/// Format a profile field for display, showing "(not set)" when empty.
+fn display<'a>(val: &'a str, fallback: &'a str) -> &'a str {
+    if val.is_empty() {
+        fallback
+    } else {
+        val
     }
-    String::new()
 }
 
-pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
+pub fn draw(app: &mut App, frame: &mut Frame, area: Rect) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -43,57 +43,102 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     let profile = app.profile.as_ref().unwrap();
+    let f = |key: &str| -> String {
+        profile
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let has_image = app.profile_image.is_some();
+    let info_height = 9;
 
     let vertical = Layout::vertical([
-        Constraint::Length(7), // Profile info
-        Constraint::Length(1), // Follows header
-        Constraint::Fill(1),   // Follows list
-        Constraint::Length(1), // Hints
+        Constraint::Length(info_height), // Profile info (with optional image)
+        Constraint::Length(1),           // Follows header
+        Constraint::Fill(1),             // Follows list
+        Constraint::Length(2),           // Hints (2 rows)
     ])
     .split(inner);
 
-    // Profile info
-    let name = field(profile, &["name", "display_name"]);
-    let about = field(profile, &["about"]);
-    let npub = field(profile, &["npub"]);
-    let npub = if npub.is_empty() {
-        app.account.as_deref().map(hex_to_npub).unwrap_or_default()
-    } else if !npub.starts_with("npub") {
-        hex_to_npub(&npub)
-    } else {
-        npub
+    // Profile info section: image (left) + text fields (right)
+    let name = f("name");
+    let display_name = f("display_name");
+    let about = f("about");
+    let picture = f("picture");
+    let nip05 = f("nip05");
+    let lud16 = f("lud16");
+    let npub = {
+        let raw = f("npub");
+        if raw.is_empty() {
+            app.account.as_deref().map(hex_to_npub).unwrap_or_default()
+        } else if !raw.starts_with("npub") {
+            hex_to_npub(&raw)
+        } else {
+            raw
+        }
     };
 
+    let label = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::White);
+    let not_set = "(not set)";
+
+    // Split info area horizontally if we have an image
+    let (image_area, text_area) = if has_image {
+        let cols = Layout::horizontal([
+            Constraint::Length(20), // Image column
+            Constraint::Fill(1),    // Text fields
+        ])
+        .split(vertical[0]);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, vertical[0])
+    };
+
+    // Render profile image
+    if let Some(img_area) = image_area {
+        if let Some(protocol) = &mut app.profile_image {
+            let image_widget = StatefulImage::default();
+            frame.render_stateful_widget(image_widget, img_area, protocol);
+        }
+    }
+
     let lines = vec![
-        Line::raw(""),
         Line::from(vec![
-            Span::styled("  Name:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Name:          ", label),
+            Span::styled(display(&name, not_set), val.add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Display name:  ", label),
+            Span::styled(display(&display_name, not_set), val),
+        ]),
+        Line::from(vec![
+            Span::styled("  About:         ", label),
+            Span::styled(display(&about, not_set), val),
+        ]),
+        Line::from(vec![
+            Span::styled("  Picture:       ", label),
             Span::styled(
-                if name.is_empty() { "(not set)" } else { &name },
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                display(&picture, not_set),
+                Style::default().fg(Color::DarkGray),
             ),
+        ]),
+        Line::from(vec![
+            Span::styled("  NIP-05:        ", label),
+            Span::styled(display(&nip05, not_set), val),
+        ]),
+        Line::from(vec![
+            Span::styled("  Lightning:     ", label),
+            Span::styled(display(&lud16, not_set), val),
         ]),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  About:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if about.is_empty() {
-                    "(not set)"
-                } else {
-                    &about
-                },
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  npub:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(npub, Style::default().fg(Color::White)),
+            Span::styled("  npub:          ", label),
+            Span::styled(npub, val),
         ]),
     ];
-    frame.render_widget(Paragraph::new(lines), vertical[0]);
+    frame.render_widget(Paragraph::new(lines), text_area);
 
     // Follows header
     let follows_header = Line::from(vec![Span::styled(
@@ -155,26 +200,46 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
         StatefulWidget::render(list, vertical[2], frame.buffer_mut(), &mut state);
     }
 
-    // Hints
-    let mut hints = vec![
+    // Hints (2 rows)
+    let hint_rows =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(vertical[3]);
+
+    let line1 = Line::from(vec![
         Span::styled("  [n] ", Style::default().fg(Color::Cyan)),
-        Span::raw("Edit name  "),
+        Span::raw("Name  "),
+        Span::styled("[D] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Display name  "),
         Span::styled("[a] ", Style::default().fg(Color::Cyan)),
-        Span::raw("Edit about  "),
+        Span::raw("About  "),
+        Span::styled("[P] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Picture  "),
+        Span::styled("[5] ", Style::default().fg(Color::Cyan)),
+        Span::raw("NIP-05  "),
+        Span::styled("[$] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Lightning  "),
         Span::styled("[e] ", Style::default().fg(Color::Cyan)),
-        Span::raw("Show nsec  "),
-    ];
+        Span::raw("Show nsec"),
+    ]);
+    frame.render_widget(Paragraph::new(line1), hint_rows[0]);
+
+    let mut line2_spans = vec![];
     if !app.follows.is_empty() {
-        hints.extend([
-            Span::styled("[j/k] ", Style::default().fg(Color::Cyan)),
+        line2_spans.extend([
+            Span::styled("  [j/k] ", Style::default().fg(Color::Cyan)),
             Span::raw("Navigate  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+            Span::raw("View  "),
             Span::styled("[d] ", Style::default().fg(Color::Cyan)),
             Span::raw("Unfollow  "),
         ]);
+    } else {
+        line2_spans.push(Span::raw("  "));
     }
-    hints.extend([
+    line2_spans.extend([
+        Span::styled("[Q] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Logout  "),
         Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
         Span::raw("Back"),
     ]);
-    frame.render_widget(Paragraph::new(Line::from(hints)), vertical[3]);
+    frame.render_widget(Paragraph::new(Line::from(line2_spans)), hint_rows[1]);
 }

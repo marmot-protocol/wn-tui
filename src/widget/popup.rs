@@ -137,7 +137,7 @@ impl Widget for PopupWidget<'_> {
 }
 
 /// Calculate a centered rectangle within the given area.
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width.saturating_sub(2));
     let h = height.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;

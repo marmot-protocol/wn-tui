@@ -123,7 +123,13 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
     if !app.search_results.is_empty() {
         hint_spans.extend([
             Span::styled("[Tab] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Follow/Unfollow  "),
+            Span::raw("Follow  "),
+            Span::styled("[F2] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Profile  "),
+            Span::styled("[F3] ", Style::default().fg(Color::Cyan)),
+            Span::raw("New group  "),
+            Span::styled("[F4] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Add to group  "),
         ]);
     }
     hint_spans.extend([

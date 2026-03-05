@@ -91,6 +91,23 @@ async fn main() -> Result<()> {
     tui::install_panic_hook();
     let mut terminal = tui::init()?;
     let mut app = App::new();
+
+    // Initialize image protocol detection (must happen after terminal setup)
+    match ratatui_image::picker::Picker::from_query_stdio() {
+        Ok(mut picker) => {
+            // iTerm2 misdetects as Kitty — override when ITERM_SESSION_ID is set
+            if std::env::var("ITERM_SESSION_ID").is_ok() {
+                picker.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
+            }
+            app.logs
+                .push(format!("Image protocol: {:?}", picker.protocol_type()));
+            app.picker = Some(picker);
+        }
+        Err(e) => {
+            app.logs
+                .push(format!("Image protocol detection failed: {e}"));
+        }
+    }
     let mut events = EventLoop::new(250);
     let action_tx = events.sender();
     let mut streams = StreamHandles::new();
@@ -162,6 +179,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::LoadProfile { .. } => "LoadProfile",
         Effect::UpdateProfile { .. } => "UpdateProfile",
         Effect::ExportNsec { .. } => "ExportNsec",
+        Effect::FetchProfileImage { .. } => "FetchProfileImage",
         Effect::LoadSettings { .. } => "LoadSettings",
         Effect::UpdateSetting { .. } => "UpdateSetting",
         Effect::LoadFollows { .. } => "LoadFollows",
@@ -170,6 +188,8 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::CheckFollow { .. } => "CheckFollow",
         Effect::SearchUsers { .. } => "SearchUsers",
         Effect::UnsubscribeSearch => "UnsubscribeSearch",
+        Effect::ShowUserProfile { .. } => "ShowUserProfile",
+        Effect::Logout { .. } => "Logout",
         Effect::TailDaemonLog => "TailDaemonLog",
     };
     send_log(tx, format!("Effect: {effect_name}"));
@@ -406,7 +426,62 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
             let tx = tx.clone();
             tokio::spawn(async move {
                 let action = match wn::exec(&["--account", &account, "groups", "invites"]).await {
-                    Ok(serde_json::Value::Array(arr)) => Action::InvitesLoaded(arr),
+                    Ok(serde_json::Value::Array(mut arr)) => {
+                        // Resolve display names for DM invites (empty group name).
+                        // The welcomer_pubkey in membership is the DM counterpart.
+                        for inv in arr.iter_mut() {
+                            let name = inv
+                                .get("group")
+                                .and_then(|g| g.get("name"))
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("");
+                            if !name.is_empty() {
+                                continue;
+                            }
+                            let Some(pubkey) = inv
+                                .get("membership")
+                                .and_then(|m| m.get("welcomer_pubkey"))
+                                .and_then(|v| v.as_str())
+                            else {
+                                continue;
+                            };
+                            if let Ok(user_val) =
+                                wn::exec(&["--account", &account, "users", "show", pubkey]).await
+                            {
+                                let display_name = user_val
+                                    .get("metadata")
+                                    .and_then(|m| {
+                                        m.get("display_name")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .or_else(|| {
+                                                m.get("name")
+                                                    .and_then(|v| v.as_str())
+                                                    .filter(|s| !s.is_empty())
+                                            })
+                                    })
+                                    .or_else(|| {
+                                        user_val
+                                            .get("display_name")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .or_else(|| {
+                                                user_val
+                                                    .get("name")
+                                                    .and_then(|v| v.as_str())
+                                                    .filter(|s| !s.is_empty())
+                                            })
+                                    });
+                                if let Some(resolved) = display_name {
+                                    if let Some(group) = inv.get_mut("group") {
+                                        group["name"] =
+                                            serde_json::Value::String(resolved.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        Action::InvitesLoaded(arr)
+                    }
                     Ok(val) => Action::InvitesLoaded(vec![val]),
                     Err(e) => Action::GroupActionError(e.to_string()),
                 };
@@ -414,14 +489,21 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
             });
         }
 
-        Effect::CreateGroup { account, name } => {
+        Effect::CreateGroup {
+            account,
+            name,
+            members,
+        } => {
             let tx = tx.clone();
             tokio::spawn(async move {
-                let action =
-                    match wn::exec(&["--account", &account, "groups", "create", &name]).await {
-                        Ok(_) => Action::GroupActionSuccess("Group created".into()),
-                        Err(e) => Action::GroupActionError(e.to_string()),
-                    };
+                let mut args = vec!["--account", &account, "groups", "create", &name];
+                for m in &members {
+                    args.push(m);
+                }
+                let action = match wn::exec(&args).await {
+                    Ok(_) => Action::GroupActionSuccess("Group created".into()),
+                    Err(e) => Action::GroupActionError(e.to_string()),
+                };
                 let _ = tx.send(Event::Action(action));
             });
         }
@@ -538,10 +620,22 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::LoadProfile { account } => {
             let tx = tx.clone();
             tokio::spawn(async move {
-                let action = match wn::exec(&["--account", &account, "profile", "show"]).await {
-                    Ok(val) => Action::ProfileLoaded(val),
-                    Err(e) => Action::ProfileUpdateError(e.to_string()),
-                };
+                // Use `users show <self>` for full metadata (picture, nip05, lud16)
+                // that `profile show` doesn't return.
+                let action =
+                    match wn::exec(&["--account", &account, "users", "show", &account]).await {
+                        Ok(val) => {
+                            // Flatten: merge metadata fields to top level for easy access
+                            let mut profile = val.clone();
+                            if let Some(meta) = val.get("metadata").and_then(|m| m.as_object()) {
+                                for (k, v) in meta {
+                                    profile[k.clone()] = v.clone();
+                                }
+                            }
+                            Action::ProfileLoaded(profile)
+                        }
+                        Err(e) => Action::ProfileUpdateError(e.to_string()),
+                    };
                 let _ = tx.send(Event::Action(action));
             });
         }
@@ -549,24 +643,36 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::UpdateProfile {
             account,
             name,
+            display_name,
             about,
+            picture,
+            nip05,
+            lud16,
         } => {
             let tx = tx.clone();
             tokio::spawn(async move {
-                let mut args = vec!["--account", &account, "profile", "update"];
-                let name_val;
-                let about_val;
-                if let Some(ref n) = name {
-                    name_val = n.clone();
-                    args.push("--name");
-                    args.push(&name_val);
+                let mut args = vec![
+                    "--account".to_string(),
+                    account,
+                    "profile".into(),
+                    "update".into(),
+                ];
+                let fields: &[(&str, &Option<String>)] = &[
+                    ("--name", &name),
+                    ("--display-name", &display_name),
+                    ("--about", &about),
+                    ("--picture", &picture),
+                    ("--nip05", &nip05),
+                    ("--lud16", &lud16),
+                ];
+                for (flag, val) in fields {
+                    if let Some(v) = val {
+                        args.push(flag.to_string());
+                        args.push(v.clone());
+                    }
                 }
-                if let Some(ref a) = about {
-                    about_val = a.clone();
-                    args.push("--about");
-                    args.push(&about_val);
-                }
-                let action = match wn::exec(&args).await {
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let action = match wn::exec(&arg_refs).await {
                     Ok(_) => Action::ProfileUpdateSuccess("Profile updated".into()),
                     Err(e) => Action::ProfileUpdateError(e.to_string()),
                 };
@@ -588,6 +694,26 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                     Err(e) => Action::NsecExportError(e.to_string()),
                 };
                 let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::FetchProfileImage { url } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = tokio::process::Command::new("curl")
+                    .args(["-s", "-L", "--max-time", "10", &url])
+                    .output()
+                    .await;
+                match result {
+                    Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                        let _ = tx.send(Event::Action(Action::ProfileImageFetched(output.stdout)));
+                    }
+                    _ => {
+                        let _ = tx.send(Event::Action(Action::Log(
+                            "Failed to fetch profile image".into(),
+                        )));
+                    }
+                }
             });
         }
 
@@ -715,6 +841,30 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
 
         Effect::UnsubscribeSearch => {
             streams.kill_search();
+        }
+
+        Effect::ShowUserProfile { account, pubkey } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action =
+                    match wn::exec(&["--account", &account, "users", "show", &pubkey]).await {
+                        Ok(val) => Action::UserProfileLoaded(val),
+                        Err(e) => Action::UserProfileError(e.to_string()),
+                    };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::Logout { account } => {
+            streams.kill_all();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&["logout", &account]).await {
+                    Ok(_) => Action::LogoutSuccess,
+                    Err(e) => Action::LogoutError(e.to_string()),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
         }
 
         Effect::TailDaemonLog => {

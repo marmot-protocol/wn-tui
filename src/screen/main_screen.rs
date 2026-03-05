@@ -206,6 +206,9 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
             key("S"),
             label("Settings"),
             sep(),
+            key("C"),
+            label("New identity"),
+            sep(),
             key("`"),
             label("Logs"),
             sep(),
@@ -237,7 +240,7 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_log_panel(app: &App, frame: &mut Frame, area: Rect) {
+pub fn draw_log_panel(app: &App, frame: &mut Frame, area: Rect) {
     let (active_label, inactive_label) = match app.log_tab {
         LogTab::Activity => ("Activity", "Daemon"),
         LogTab::Daemon => ("Daemon", "Activity"),
