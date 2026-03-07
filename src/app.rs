@@ -71,6 +71,7 @@ pub enum InputPurpose {
     EditPicture,
     EditNip05,
     EditLud16,
+    ReactionEmoji,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +113,8 @@ pub struct App {
     pub active_group_id: Option<String>,
     pub messages: Vec<Value>,
     pub message_scroll: usize,
+    pub selected_message: Option<usize>,
+    pub message_viewport_height: usize,
     pub composer: Input,
 
     // Notifications
@@ -179,6 +182,8 @@ impl App {
             active_group_id: None,
             messages: Vec::new(),
             message_scroll: 0,
+            selected_message: None,
+            message_viewport_height: 20, // updated each render
             composer: Input::new(),
             unread_counts: HashMap::new(),
             connected: false,
@@ -269,6 +274,27 @@ impl App {
                 });
             }
 
+            // Reactions
+            Action::ReactionSuccess => {
+                // Reload messages to get updated reaction counts
+                if let (Some(account), Some(group_id)) =
+                    (&self.account, &self.active_group_id)
+                {
+                    return vec![Effect::LoadMessages {
+                        account: account.clone(),
+                        group_id: group_id.clone(),
+                    }];
+                }
+            }
+            Action::MessagesLoaded(msgs) => {
+                self.messages = msgs;
+            }
+            Action::ReactionError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Reaction failed: {msg}"),
+                });
+            }
+
             // Notifications
             Action::NotificationUpdate(val) => {
                 self.handle_notification(val);
@@ -297,17 +323,29 @@ impl App {
             Action::GroupActionSuccess(msg) => {
                 self.status_message = Some(msg.clone());
                 self.popup = None;
-                // If we left a group, go back to main
+                // If we left a group, remove from chat list and go back to main
                 if msg.contains("Left group") {
+                    if let Some(gid) = &self.viewing_group_id {
+                        self.chats
+                            .retain(|c| chat_list::group_id(c).as_ref() != Some(gid));
+                        if !self.chats.is_empty() {
+                            self.selected_chat = self.selected_chat.min(self.chats.len() - 1);
+                        } else {
+                            self.selected_chat = 0;
+                        }
+                    }
                     self.screen = Screen::Main;
                     self.viewing_group_id = None;
+                    return vec![];
                 }
                 // Reload group detail if still on that screen
                 if self.screen == Screen::GroupDetail {
                     return self.reload_group_detail();
                 }
-                // Re-subscribe to chats to pick up changes
+                // Re-subscribe to chats to pick up changes (e.g., after accepting invite)
                 if let Some(account) = &self.account {
+                    self.chats.clear();
+                    self.selected_chat = 0;
                     return vec![Effect::SubscribeChats {
                         account: account.clone(),
                     }];
@@ -669,6 +707,13 @@ impl App {
     }
 
     fn handle_message_update(&mut self, val: Value) {
+        // Only display chat messages (kind 9), skip reactions (7), deletions (5), etc.
+        if let Some(kind) = val.get("kind").and_then(|v| v.as_u64()) {
+            if kind != 9 {
+                return;
+            }
+        }
+
         // Deduplicate by message id
         if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
             if self
@@ -974,6 +1019,12 @@ impl App {
                     Some(value),
                 )]
             }
+            InputPurpose::ReactionEmoji => {
+                if value.is_empty() {
+                    return vec![];
+                }
+                self.react_to_selected(&value)
+            }
         }
     }
 
@@ -1184,21 +1235,131 @@ impl App {
         ]
     }
 
+    /// Currently selected message index, defaulting to the newest.
+    fn selected_msg_index(&self) -> Option<usize> {
+        if self.messages.is_empty() {
+            return None;
+        }
+        match self.selected_message {
+            Some(idx) => Some(idx.min(self.messages.len() - 1)),
+            None => Some(self.messages.len() - 1),
+        }
+    }
+
+    /// Nudge viewport scroll by 1 if the selection moved outside the visible range.
+    fn scroll_to_follow(&mut self, direction: isize) {
+        let sel = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return,
+        };
+        let last = self.messages.len().saturating_sub(1);
+        let bottom_visible = last.saturating_sub(self.message_scroll);
+
+        if direction > 0 && sel > bottom_visible {
+            // Selection below viewport — scroll down by 1
+            self.message_scroll = self.message_scroll.saturating_sub(1);
+        } else if direction < 0 {
+            // Selection moved up — scroll up only if selection is no longer rendered.
+            // The viewport fits ~message_viewport_height rows. Assume each message
+            // averages 1 row (short messages). If selection is more than viewport_height
+            // messages above the bottom, it's likely off-screen.
+            let distance_from_bottom = bottom_visible.saturating_sub(sel);
+            if distance_from_bottom >= self.message_viewport_height {
+                self.message_scroll += 1;
+            }
+        }
+    }
+
+    fn react_to_selected(&self, emoji: &str) -> Vec<Effect> {
+        let (account, group_id) = match (&self.account, &self.active_group_id) {
+            (Some(a), Some(g)) => (a.clone(), g.clone()),
+            _ => return vec![],
+        };
+        let msg_idx = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let message_id = match self.messages[msg_idx].get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return vec![],
+        };
+        vec![Effect::ReactToMessage {
+            account,
+            group_id,
+            message_id,
+            emoji: emoji.to_string(),
+        }]
+    }
+
+    fn unreact_to_selected(&self) -> Vec<Effect> {
+        let (account, group_id) = match (&self.account, &self.active_group_id) {
+            (Some(a), Some(g)) => (a.clone(), g.clone()),
+            _ => return vec![],
+        };
+        let msg_idx = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let message_id = match self.messages[msg_idx].get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return vec![],
+        };
+        vec![Effect::UnreactToMessage {
+            account,
+            group_id,
+            message_id,
+        }]
+    }
+
     fn handle_messages_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match key.code {
             KeyCode::Char('k') | KeyCode::Up => {
-                let max = self.messages.len().saturating_sub(1);
-                self.message_scroll = (self.message_scroll + 1).min(max);
+                // Move selection up (toward older messages)
+                if !self.messages.is_empty() {
+                    let current = self.selected_msg_index().unwrap_or(self.messages.len() - 1);
+                    self.selected_message = Some(current.saturating_sub(1));
+                    self.scroll_to_follow(-1);
+                }
                 vec![]
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.message_scroll = self.message_scroll.saturating_sub(1);
+                // Move selection down (toward newer messages)
+                if !self.messages.is_empty() {
+                    let current = self.selected_msg_index().unwrap_or(self.messages.len() - 1);
+                    let max = self.messages.len() - 1;
+                    self.selected_message = Some((current + 1).min(max));
+                    self.scroll_to_follow(1);
+                }
                 vec![]
             }
             KeyCode::Char('G') => {
-                self.message_scroll = 0;
+                // Jump to newest message
+                if !self.messages.is_empty() {
+                    self.selected_message = Some(self.messages.len() - 1);
+                    self.message_scroll = 0;
+                }
                 vec![]
             }
+            KeyCode::Char('g') => {
+                // Jump to oldest message
+                if !self.messages.is_empty() {
+                    self.selected_message = Some(0);
+                    self.message_scroll = self.messages.len().saturating_sub(1);
+                }
+                vec![]
+            }
+            KeyCode::Char('r') => {
+                // Open emoji input popup, pre-filled with default reaction
+                let mut input = Input::new();
+                input.insert('+');
+                self.popup = Some(Popup::TextInput {
+                    title: "React with emoji".into(),
+                    input,
+                    purpose: InputPurpose::ReactionEmoji,
+                });
+                vec![]
+            }
+            KeyCode::Char('u') => self.unreact_to_selected(),
             KeyCode::Char('i') | KeyCode::Enter => {
                 self.focus = Panel::Composer;
                 vec![]
@@ -1293,6 +1454,7 @@ impl App {
         self.active_group_id = Some(group_id.clone());
         self.messages.clear();
         self.message_scroll = 0;
+        self.selected_message = None;
         self.focus = Panel::Messages;
         self.unread_counts.remove(&group_id);
 
@@ -1888,6 +2050,14 @@ impl App {
             .split(full_area);
         let area = vertical[0];
 
+        // Update message viewport height estimate for scroll calculations
+        if self.screen == Screen::Main {
+            // full_area minus: log panel, hints (1), status bar (1), borders (2), composer (~5)
+            let chrome = log_height + 1 + 1 + 2 + 5;
+            self.message_viewport_height =
+                (full_area.height.saturating_sub(chrome) as usize).max(3);
+        }
+
         match &self.screen {
             Screen::Login => crate::screen::login::draw(self, frame, area),
             Screen::Main => crate::screen::main_screen::draw(self, frame, full_area),
@@ -2325,6 +2495,8 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("Enter", "Select chat"));
             lines.push(hint("Tab", "Switch focus"));
             lines.push(hint("i / Enter", "Start typing (messages)"));
+            lines.push(hint("r", "React to message"));
+            lines.push(hint("u", "Unreact"));
             lines.push(hint("Esc", "Unfocus / back"));
             lines.push(hint("n", "New group"));
             lines.push(hint("g", "Group info"));
@@ -2660,6 +2832,16 @@ mod tests {
         assert_eq!(app.messages.len(), 0);
     }
 
+    #[test]
+    fn message_update_skips_reaction_and_deletion_events() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.update(msg_update(json!({"id": "msg1", "content": "hello", "kind": 9})));
+        app.update(msg_update(json!({"id": "r1", "content": "+", "kind": 7})));
+        app.update(msg_update(json!({"id": "d1", "content": "", "kind": 5})));
+        assert_eq!(app.messages.len(), 1, "Only kind-9 chat messages should be kept");
+    }
+
     // ── Notifications ────────────────────────────────────────────────
 
     #[test]
@@ -2861,6 +3043,24 @@ mod tests {
         let mut app = app_on_group_detail();
         app.update(Action::GroupActionSuccess("Left group".into()));
         assert_eq!(app.screen, Screen::Main);
+    }
+
+    #[test]
+    fn leave_group_removes_from_chat_list() {
+        let mut app = app_on_group_detail();
+        app.chats = vec![
+            json!({"name": "Other", "mls_group_id": "other1"}),
+            json!({"name": "Coffee Chat", "mls_group_id": "g1"}),
+            json!({"name": "Third", "mls_group_id": "g3"}),
+        ];
+        app.selected_chat = 1;
+        app.update(Action::GroupActionSuccess("Left group".into()));
+        assert_eq!(app.chats.len(), 2);
+        assert!(app
+            .chats
+            .iter()
+            .all(|c| chat_list::group_id(c).as_deref() != Some("g1")));
+        assert!(app.selected_chat < app.chats.len());
     }
 
     #[test]
@@ -3510,6 +3710,124 @@ mod tests {
 
         app.update(msg_update(json!({"content": "new"})));
         assert_eq!(app.message_scroll, 0, "should auto-scroll");
+    }
+
+    // ── Reactions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn react_opens_emoji_popup() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![
+            json!({"id": "msg1", "content": "hello", "author": "a"}),
+            json!({"id": "msg2", "content": "world", "author": "b"}),
+        ];
+        app.update(Action::Key(key(KeyCode::Char('r'))));
+        match &app.popup {
+            Some(Popup::TextInput { purpose, input, .. }) => {
+                assert_eq!(*purpose, InputPurpose::ReactionEmoji);
+                assert_eq!(input.value, "+"); // pre-filled with default
+            }
+            other => panic!("Expected TextInput popup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn react_submit_emits_effect() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![
+            json!({"id": "msg1", "content": "hello", "author": "a"}),
+        ];
+        app.selected_message = Some(0);
+        // Open popup and submit
+        app.update(Action::Key(key(KeyCode::Char('r'))));
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ReactToMessage { ref message_id, ref emoji, .. }
+            if message_id == "msg1" && emoji == "+"
+        )));
+    }
+
+    #[test]
+    fn k_moves_selection_up() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![
+            json!({"id": "msg1", "content": "a", "author": "a"}),
+            json!({"id": "msg2", "content": "b", "author": "a"}),
+            json!({"id": "msg3", "content": "c", "author": "a"}),
+        ];
+        // Default: no selection = newest (index 2)
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        assert_eq!(app.selected_message, Some(1));
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        assert_eq!(app.selected_message, Some(0));
+        // Clamps at 0
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        assert_eq!(app.selected_message, Some(0));
+    }
+
+    #[test]
+    fn j_moves_selection_down() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![
+            json!({"id": "msg1", "content": "a", "author": "a"}),
+            json!({"id": "msg2", "content": "b", "author": "a"}),
+        ];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.selected_message, Some(1));
+        // Clamps at max
+        app.update(Action::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.selected_message, Some(1));
+    }
+
+    #[test]
+    fn unreact_emits_effect() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({"id": "msg1", "content": "hi", "author": "a"})];
+        app.message_scroll = 0;
+        let effects = app.update(Action::Key(key(KeyCode::Char('u'))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::UnreactToMessage { ref message_id, .. } if message_id == "msg1"
+        )));
+    }
+
+    #[test]
+    fn react_with_no_messages_is_noop() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![];
+        let effects = app.update(Action::Key(key(KeyCode::Char('r'))));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn react_without_group_is_noop() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = None;
+        app.messages = vec![json!({"id": "msg1", "content": "hi", "author": "a"})];
+        let effects = app.update(Action::Key(key(KeyCode::Char('r'))));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn reaction_error_shows_popup() {
+        let mut app = app_on_main();
+        app.update(Action::ReactionError("fail".into()));
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
     }
 
     // ── Invite popup navigation ──────────────────────────────────────

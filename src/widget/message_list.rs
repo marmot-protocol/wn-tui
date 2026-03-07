@@ -164,6 +164,8 @@ pub struct MessageListWidget<'a> {
     scroll_from_bottom: usize,
     block: Option<Block<'a>>,
     my_pubkey: Option<&'a str>,
+    /// If set, highlight this message index (absolute index into messages slice).
+    selected: Option<usize>,
 }
 
 impl<'a> MessageListWidget<'a> {
@@ -173,6 +175,7 @@ impl<'a> MessageListWidget<'a> {
             scroll_from_bottom,
             block: None,
             my_pubkey: None,
+            selected: None,
         }
     }
 
@@ -183,6 +186,11 @@ impl<'a> MessageListWidget<'a> {
 
     pub fn my_pubkey(mut self, pubkey: Option<&'a str>) -> Self {
         self.my_pubkey = pubkey;
+        self
+    }
+
+    pub fn selected(mut self, selected: Option<usize>) -> Self {
+        self.selected = selected;
         self
     }
 }
@@ -238,11 +246,24 @@ impl Widget for MessageListWidget<'_> {
             let msg = &self.messages[idx];
             let lines = format_message(msg, self.my_pubkey);
             let h = message_height(msg, width);
+            let is_selected = self.selected == Some(idx);
 
             let msg_area = Rect::new(inner.x, y, inner.width, h as u16);
+
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .render(msg_area, buf);
+
+            if is_selected {
+                // Apply background highlight after text rendering
+                for row in msg_area.y..msg_area.y + msg_area.height {
+                    for col in msg_area.x..msg_area.x + msg_area.width {
+                        if let Some(cell) = buf.cell_mut((col, row)) {
+                            cell.set_bg(Color::DarkGray);
+                        }
+                    }
+                }
+            }
 
             y += h as u16;
             if y >= inner.y + inner.height {

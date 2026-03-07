@@ -30,6 +30,11 @@ pub enum Action {
     MessageSent,
     MessageSendError(String),
 
+    // Reactions
+    ReactionSuccess,
+    ReactionError(String),
+    MessagesLoaded(Vec<Value>),
+
     // Notifications (streaming)
     NotificationUpdate(Value),
     NotificationStreamEnded,
@@ -104,6 +109,24 @@ pub enum Effect {
         account: String,
         group_id: String,
         text: String,
+    },
+
+    LoadMessages {
+        account: String,
+        group_id: String,
+    },
+
+    // Reactions
+    ReactToMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
+        emoji: String,
+    },
+    UnreactToMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
     },
 
     // Group management

@@ -166,6 +166,9 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::SubscribeMessages { .. } => "SubscribeMessages",
         Effect::UnsubscribeMessages => "UnsubscribeMessages",
         Effect::SendMessage { .. } => "SendMessage",
+        Effect::LoadMessages { .. } => "LoadMessages",
+        Effect::ReactToMessage { .. } => "ReactToMessage",
+        Effect::UnreactToMessage { .. } => "UnreactToMessage",
         Effect::LoadGroupDetail { .. } => "LoadGroupDetail",
         Effect::LoadGroupMembers { .. } => "LoadGroupMembers",
         Effect::LoadInvites { .. } => "LoadInvites",
@@ -380,6 +383,76 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                         Ok(_) => Action::MessageSent,
                         Err(e) => Action::MessageSendError(e.to_string()),
                     };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::LoadMessages { account, group_id } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&[
+                    "--account",
+                    &account,
+                    "messages",
+                    "list",
+                    &group_id,
+                ])
+                .await
+                {
+                    Ok(serde_json::Value::Array(arr)) => Action::MessagesLoaded(arr),
+                    Ok(val) => Action::MessagesLoaded(vec![val]),
+                    Err(e) => Action::Log(format!("Failed to reload messages: {e}")),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::ReactToMessage {
+            account,
+            group_id,
+            message_id,
+            emoji,
+        } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&[
+                    "--account",
+                    &account,
+                    "messages",
+                    "react",
+                    &group_id,
+                    &message_id,
+                    &emoji,
+                ])
+                .await
+                {
+                    Ok(_) => Action::ReactionSuccess,
+                    Err(e) => Action::ReactionError(e.to_string()),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::UnreactToMessage {
+            account,
+            group_id,
+            message_id,
+        } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&[
+                    "--account",
+                    &account,
+                    "messages",
+                    "unreact",
+                    &group_id,
+                    &message_id,
+                ])
+                .await
+                {
+                    Ok(_) => Action::ReactionSuccess,
+                    Err(e) => Action::ReactionError(e.to_string()),
+                };
                 let _ = tx.send(Event::Action(action));
             });
         }

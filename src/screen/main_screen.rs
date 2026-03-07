@@ -133,9 +133,24 @@ fn draw_messages(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    // Show selection highlight when Messages panel is focused
+    let selected = if app.focus == Panel::Messages {
+        app.selected_message
+            .or_else(|| {
+                if app.messages.is_empty() {
+                    None
+                } else {
+                    Some(app.messages.len() - 1)
+                }
+            })
+    } else {
+        None
+    };
+
     let widget = MessageListWidget::new(&app.messages, app.message_scroll)
         .block(block)
-        .my_pubkey(app.account.as_deref());
+        .my_pubkey(app.account.as_deref())
+        .selected(selected);
     frame.render_widget(widget, area);
 }
 
@@ -217,10 +232,16 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
         ],
         Panel::Messages => vec![
             key("j/k"),
-            label("Scroll"),
+            label("Select"),
             sep(),
-            key("G"),
-            label("Bottom"),
+            key("g/G"),
+            label("Top/Bottom"),
+            sep(),
+            key("r"),
+            label("React"),
+            sep(),
+            key("u"),
+            label("Unreact"),
             sep(),
             key("i"),
             label("Compose"),
