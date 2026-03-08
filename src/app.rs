@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 use serde_json::Value;
 
 use crate::action::{Action, Effect};
@@ -41,21 +43,52 @@ pub enum Popup {
     Error {
         message: String,
     },
+    Info {
+        title: String,
+        message: String,
+    },
+    UserProfile {
+        data: Value,
+    },
+    GroupInfo {
+        data: Value,
+    },
+    GroupPicker {
+        pubkey: String,
+        selected: usize,
+    },
+    ImageViewer {
+        img_width: u32,
+        img_height: u32,
+    },
+    FileBrowser {
+        path: std::path::PathBuf,
+        entries: Vec<(String, bool)>, // (name, is_dir)
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputPurpose {
     CreateGroup,
+    CreateGroupWithUser { pubkey: String },
     AddMember,
     RenameGroup,
     EditProfileName,
+    EditDisplayName,
     EditProfileAbout,
+    EditPicture,
+    EditNip05,
+    EditLud16,
+    ReactionEmoji,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfirmPurpose {
     LeaveGroup,
     RemoveMember { npub: String },
+    DeleteMessage { message_id: String },
+    Logout { account: String },
 }
 
 /// Why the user search screen was opened.
@@ -63,6 +96,14 @@ pub enum ConfirmPurpose {
 pub enum SearchPurpose {
     Browse,
     AddMember { group_id: String },
+}
+
+/// State of a media download.
+#[derive(Debug, Clone)]
+pub enum MediaDownload {
+    Downloading,
+    Downloaded(String), // file_path
+    Failed(String),     // error
 }
 
 /// Which log tab is active.
@@ -90,7 +131,11 @@ pub struct App {
     pub active_group_id: Option<String>,
     pub messages: Vec<Value>,
     pub message_scroll: usize,
+    pub selected_message: Option<usize>,
+    pub message_viewport_height: usize,
     pub composer: Input,
+    /// Active reply context: (event_id, author_name, content_preview).
+    pub reply_to: Option<(String, String, String)>,
 
     // Notifications
     pub unread_counts: HashMap<String, usize>,
@@ -110,6 +155,9 @@ pub struct App {
 
     // Profile
     pub profile: Option<Value>,
+    pub picker: Option<Picker>,
+    pub profile_image: Option<StatefulProtocol>,
+    pub popup_image: Option<StatefulProtocol>,
 
     // Settings
     pub settings_data: Option<Value>,
@@ -125,6 +173,11 @@ pub struct App {
     pub search_results: Vec<Value>,
     pub selected_result: usize,
     pub search_purpose: SearchPurpose,
+    pub follow_checks: HashMap<String, bool>,
+
+    // Media
+    pub media_downloads: HashMap<String, MediaDownload>,
+    pub inline_images: HashMap<String, StatefulProtocol>,
 
     // Log panel
     pub show_logs: bool,
@@ -153,7 +206,10 @@ impl App {
             active_group_id: None,
             messages: Vec::new(),
             message_scroll: 0,
+            selected_message: None,
+            message_viewport_height: 20, // updated each render
             composer: Input::new(),
+            reply_to: None,
             unread_counts: HashMap::new(),
             connected: false,
             viewing_group_id: None,
@@ -163,6 +219,9 @@ impl App {
             selected_member: 0,
             popup: None,
             profile: None,
+            picker: None,
+            profile_image: None,
+            popup_image: None,
             settings_data: None,
             selected_setting: 0,
             follows: Vec::new(),
@@ -171,6 +230,9 @@ impl App {
             search_results: Vec::new(),
             selected_result: 0,
             search_purpose: SearchPurpose::Browse,
+            follow_checks: HashMap::new(),
+            media_downloads: HashMap::new(),
+            inline_images: HashMap::new(),
             show_logs: false,
             logs: Vec::new(),
             daemon_logs: Vec::new(),
@@ -226,7 +288,7 @@ impl App {
             // Message streaming
             Action::MessageUpdate { group_id, message } => {
                 if self.active_group_id.as_deref() == Some(&group_id) {
-                    self.handle_message_update(message);
+                    return self.handle_message_update(message);
                 }
             }
             Action::MessageStreamEnded => {}
@@ -236,6 +298,131 @@ impl App {
             Action::MessageSendError(msg) => {
                 self.popup = Some(Popup::Error {
                     message: format!("Send failed: {msg}"),
+                });
+            }
+
+            // Reactions
+            Action::ReactionSuccess => {
+                // Reload messages to get updated reaction counts
+                if let (Some(account), Some(group_id)) = (&self.account, &self.active_group_id) {
+                    return vec![Effect::LoadMessages {
+                        account: account.clone(),
+                        group_id: group_id.clone(),
+                    }];
+                }
+            }
+            Action::MessagesLoaded(msgs) => {
+                self.messages = msgs;
+                let mut effects = Vec::new();
+                for msg in &self.messages {
+                    for (hash, _, _) in Self::image_attachments(msg) {
+                        if !self.media_downloads.contains_key(&hash) {
+                            if let (Some(account), Some(group_id)) =
+                                (&self.account, &self.active_group_id)
+                            {
+                                self.media_downloads
+                                    .insert(hash.clone(), MediaDownload::Downloading);
+                                effects.push(Effect::DownloadMedia {
+                                    account: account.clone(),
+                                    group_id: group_id.clone(),
+                                    file_hash: hash,
+                                });
+                            }
+                        }
+                    }
+                }
+                if !effects.is_empty() {
+                    return effects;
+                }
+            }
+            Action::ReactionError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Reaction failed: {msg}"),
+                });
+            }
+
+            // Message deletion
+            Action::MessageDeleted { message_id } => {
+                self.messages
+                    .retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(&message_id));
+            }
+            Action::MessageDeleteError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Delete failed: {msg}"),
+                });
+            }
+
+            // Media
+            Action::MediaDownloaded {
+                file_hash,
+                file_path,
+            } => {
+                self.media_downloads.insert(
+                    file_hash.clone(),
+                    MediaDownload::Downloaded(file_path.clone()),
+                );
+                // Auto-load image for inline display
+                return vec![Effect::LoadMediaImage {
+                    file_hash,
+                    file_path,
+                }];
+            }
+            Action::MediaDownloadFailed { file_hash, error } => {
+                self.logs.push(format!("Media download failed: {error}"));
+                self.media_downloads
+                    .insert(file_hash, MediaDownload::Failed(error));
+            }
+            Action::MediaImageLoaded { file_hash, bytes } => {
+                if let Some(picker) = &self.picker {
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            self.logs.push(format!(
+                                "Inline image ready: {} ({}x{}, {} bytes)",
+                                &file_hash[..file_hash.len().min(16)],
+                                img.width(),
+                                img.height(),
+                                bytes.len()
+                            ));
+                            let proto = picker.new_resize_protocol(img);
+                            self.inline_images.insert(file_hash, proto);
+                        }
+                        Err(e) => {
+                            self.logs
+                                .push(format!("Image decode failed for {file_hash}: {e}"));
+                        }
+                    }
+                }
+            }
+
+            Action::MediaPopupReady {
+                bytes,
+                img_width,
+                img_height,
+            } => {
+                if let Some(picker) = &self.picker {
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let proto = picker.new_resize_protocol(img);
+                            self.popup_image = Some(proto);
+                            self.popup = Some(Popup::ImageViewer {
+                                img_width,
+                                img_height,
+                            });
+                        }
+                        Err(e) => {
+                            self.logs.push(format!("Popup image decode failed: {e}"));
+                        }
+                    }
+                }
+            }
+
+            Action::MediaUploaded => {
+                self.logs.push("Media uploaded successfully".to_string());
+            }
+            Action::MediaUploadError(e) => {
+                self.logs.push(format!("Media upload failed: {e}"));
+                self.popup = Some(Popup::Error {
+                    message: format!("Upload failed: {e}"),
                 });
             }
 
@@ -267,17 +454,29 @@ impl App {
             Action::GroupActionSuccess(msg) => {
                 self.status_message = Some(msg.clone());
                 self.popup = None;
-                // If we left a group, go back to main
+                // If we left a group, remove from chat list and go back to main
                 if msg.contains("Left group") {
+                    if let Some(gid) = &self.viewing_group_id {
+                        self.chats
+                            .retain(|c| chat_list::group_id(c).as_ref() != Some(gid));
+                        if !self.chats.is_empty() {
+                            self.selected_chat = self.selected_chat.min(self.chats.len() - 1);
+                        } else {
+                            self.selected_chat = 0;
+                        }
+                    }
                     self.screen = Screen::Main;
                     self.viewing_group_id = None;
+                    return vec![];
                 }
                 // Reload group detail if still on that screen
                 if self.screen == Screen::GroupDetail {
                     return self.reload_group_detail();
                 }
-                // Re-subscribe to chats to pick up changes
+                // Re-subscribe to chats to pick up changes (e.g., after accepting invite)
                 if let Some(account) = &self.account {
+                    self.chats.clear();
+                    self.selected_chat = 0;
                     return vec![Effect::SubscribeChats {
                         account: account.clone(),
                     }];
@@ -291,7 +490,40 @@ impl App {
 
             // Profile
             Action::ProfileLoaded(val) => {
+                let url = val
+                    .get("picture")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
                 self.profile = Some(val);
+                self.profile_image = None;
+                if let Some(url) = url {
+                    self.logs.push(format!("Fetching profile image: {url}"));
+                    return vec![Effect::FetchProfileImage { url }];
+                }
+            }
+            Action::ProfileImageFetched(bytes) => {
+                self.logs
+                    .push(format!("Image received: {} bytes", bytes.len()));
+                if let Some(picker) = &self.picker {
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let proto = picker.new_resize_protocol(img);
+                            if matches!(self.popup, Some(Popup::UserProfile { .. })) {
+                                self.popup_image = Some(proto);
+                            } else {
+                                self.profile_image = Some(proto);
+                            }
+                            self.logs.push("Image decoded and protocol created".into());
+                        }
+                        Err(e) => {
+                            self.logs.push(format!("Image decode failed: {e}"));
+                        }
+                    }
+                } else {
+                    self.logs
+                        .push("No image picker available (terminal may not support images)".into());
+                }
             }
             Action::ProfileUpdateSuccess(msg) => {
                 self.status_message = Some(msg);
@@ -304,6 +536,17 @@ impl App {
             Action::ProfileUpdateError(msg) => {
                 self.popup = Some(Popup::Error {
                     message: format!("Error: {msg}"),
+                });
+            }
+            Action::NsecExported(nsec) => {
+                self.popup = Some(Popup::Info {
+                    title: "Show nsec".into(),
+                    message: nsec,
+                });
+            }
+            Action::NsecExportError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Export nsec failed: {msg}"),
                 });
             }
 
@@ -343,12 +586,58 @@ impl App {
             Action::FollowError(msg) => {
                 self.popup = Some(Popup::Error { message: msg });
             }
+            Action::FollowCheckResult { pubkey, following } => {
+                self.follow_checks.insert(pubkey, following);
+            }
 
             // User search
             Action::SearchResult(val) => {
+                let pubkey = val
+                    .get("pubkey")
+                    .or_else(|| val.get("npub"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 self.search_results.push(val);
+                if let (Some(pk), Some(account)) = (pubkey, &self.account) {
+                    if !self.follow_checks.contains_key(&pk) {
+                        return vec![Effect::CheckFollow {
+                            account: account.clone(),
+                            pubkey: pk,
+                        }];
+                    }
+                }
             }
             Action::SearchStreamEnded => {}
+            Action::UserProfileLoaded(data) => {
+                let url = data
+                    .get("metadata")
+                    .and_then(|m| m.get("picture"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                self.popup_image = None;
+                self.popup = Some(Popup::UserProfile { data });
+                if let Some(url) = url {
+                    self.logs
+                        .push(format!("Fetching user profile image: {url}"));
+                    return vec![Effect::FetchProfileImage { url }];
+                }
+            }
+            // Account management
+            Action::LogoutSuccess => {
+                return self.handle_logout();
+            }
+            Action::LogoutError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Logout failed: {msg}"),
+                });
+            }
+
+            Action::UserProfileError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Error: {msg}"),
+                });
+            }
 
             // Logs
             Action::Log(msg) => {
@@ -422,6 +711,58 @@ impl App {
         ]
     }
 
+    /// Build an `UpdateProfile` effect from the given field values.
+    fn profile_update(
+        account: String,
+        name: Option<String>,
+        display_name: Option<String>,
+        about: Option<String>,
+        picture: Option<String>,
+        nip05: Option<String>,
+        lud16: Option<String>,
+    ) -> Effect {
+        Effect::UpdateProfile {
+            account,
+            name,
+            display_name,
+            about,
+            picture,
+            nip05,
+            lud16,
+        }
+    }
+
+    /// Reset all account-specific UI state and navigate to the account selector.
+    /// Does NOT call `wn logout` — just clears in-memory state and re-checks accounts.
+    fn reset_to_account_select(&mut self) -> Vec<Effect> {
+        self.screen = Screen::Login;
+        self.login_mode = LoginMode::Loading("Checking accounts...".into());
+        self.account = None;
+        self.status_message = None;
+        self.chats.clear();
+        self.messages.clear();
+        self.active_group_id = None;
+        self.unread_counts.clear();
+        self.connected = false;
+        self.popup = None;
+        self.profile = None;
+        self.profile_image = None;
+        self.follows.clear();
+        self.follow_checks.clear();
+        self.viewing_group_id = None;
+        self.group_detail = None;
+        self.group_members.clear();
+        self.group_admins.clear();
+        self.media_downloads.clear();
+        self.inline_images.clear();
+        self.reply_to = None;
+        vec![Effect::CheckAccounts]
+    }
+
+    fn handle_logout(&mut self) -> Vec<Effect> {
+        self.reset_to_account_select()
+    }
+
     /// Total unread messages across all chats.
     pub fn total_unread(&self) -> usize {
         self.unread_counts.values().sum()
@@ -435,8 +776,17 @@ impl App {
             .count()
     }
 
-    /// Check if a pubkey is in the follows list.
+    fn clear_search_results(&mut self) {
+        self.search_results.clear();
+        self.follow_checks.clear();
+        self.selected_result = 0;
+    }
+
+    /// Check if a pubkey is followed. Uses authoritative check cache first, falls back to local list.
     pub fn is_following(&self, pubkey: &str) -> bool {
+        if let Some(&checked) = self.follow_checks.get(pubkey) {
+            return checked;
+        }
         self.follows
             .iter()
             .any(|f| f.get("pubkey").and_then(|v| v.as_str()) == Some(pubkey))
@@ -476,6 +826,13 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
+        // Paste into active popup text input if one is open
+        if let Some(Popup::TextInput { input, .. }) = &mut self.popup {
+            for ch in text.chars() {
+                input.insert(ch);
+            }
+            return;
+        }
         let input = match self.screen {
             Screen::Login => Some(&mut self.nsec_input),
             Screen::UserSearch => Some(&mut self.search_input),
@@ -489,7 +846,89 @@ impl App {
         }
     }
 
-    fn handle_message_update(&mut self, val: Value) {
+    /// Extract image attachments from a message: (file_hash_hex, mime_type, filename).
+    ///
+    /// CLI attachment fields (verified 2026-03-07):
+    ///   `original_file_hash` — hex string or byte vec
+    ///   `mime_type` — e.g. "image/jpeg"
+    ///   `file_metadata` — may contain filename
+    ///   `blossom_url` — fallback for filename extraction
+    pub fn image_attachments(msg: &Value) -> Vec<(String, String, String)> {
+        let attachments = match msg.get("media_attachments").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => return vec![],
+        };
+        let mut result = Vec::new();
+        for att in attachments {
+            let mime = att.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
+            if !mime.starts_with("image/") {
+                continue;
+            }
+            // Extract filename: try file_metadata.original_filename, then filename, then blossom_url basename
+            let filename = att
+                .get("file_metadata")
+                .and_then(|m| m.get("original_filename").or_else(|| m.get("filename")))
+                .and_then(|v| v.as_str())
+                .or_else(|| att.get("filename").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    att.get("blossom_url")
+                        .and_then(|v| v.as_str())
+                        .and_then(|url| url.rsplit('/').next())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "image".to_string());
+            // Hash: try original_file_hash first, then file_hash, then encrypted_file_hash
+            let hash_hex = crate::util::extract_hash_hex(att, "original_file_hash")
+                .or_else(|| crate::util::extract_hash_hex(att, "file_hash"))
+                .or_else(|| crate::util::extract_hash_hex(att, "encrypted_file_hash"));
+            let hash_hex = match hash_hex {
+                Some(h) if !h.is_empty() => h,
+                _ => continue,
+            };
+            result.push((hash_hex, mime.to_string(), filename));
+        }
+        result
+    }
+
+    /// Emit download effects for image attachments not already tracked.
+    fn download_effects_for_message(&mut self, msg: &Value) -> Vec<Effect> {
+        let (account, group_id) = match (&self.account, &self.active_group_id) {
+            (Some(a), Some(g)) => (a.clone(), g.clone()),
+            _ => return vec![],
+        };
+        let attachments = Self::image_attachments(msg);
+        if !attachments.is_empty() {
+            self.logs.push(format!(
+                "Auto-download: found {} image attachment(s)",
+                attachments.len()
+            ));
+        }
+        let mut effects = Vec::new();
+        for (hash, _, filename) in attachments {
+            if !self.media_downloads.contains_key(&hash) {
+                self.logs
+                    .push(format!("Auto-download: queuing {filename} (hash={hash})"));
+                self.media_downloads
+                    .insert(hash.clone(), MediaDownload::Downloading);
+                effects.push(Effect::DownloadMedia {
+                    account: account.clone(),
+                    group_id: group_id.clone(),
+                    file_hash: hash,
+                });
+            }
+        }
+        effects
+    }
+
+    fn handle_message_update(&mut self, val: Value) -> Vec<Effect> {
+        // Only display chat messages (kind 9), skip reactions (7), deletions (5), etc.
+        if let Some(kind) = val.get("kind").and_then(|v| v.as_u64()) {
+            if kind != 9 {
+                return vec![];
+            }
+        }
+
         // Deduplicate by message id
         if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
             if self
@@ -497,14 +936,16 @@ impl App {
                 .iter()
                 .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id))
             {
-                return;
+                return vec![];
             }
         }
+        let effects = self.download_effects_for_message(&val);
         let was_at_bottom = self.message_scroll == 0;
         self.messages.push(val);
         if !was_at_bottom {
             self.message_scroll += 1;
         }
+        effects
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -531,8 +972,9 @@ impl App {
             return vec![];
         }
 
-        // Tab switches log tabs when log panel is visible
-        if key.code == KeyCode::Tab && self.show_logs && self.screen == Screen::Main {
+        // Tab switches log tabs when log panel is visible (on screens where Tab isn't used)
+        if key.code == KeyCode::Tab && self.show_logs && !matches!(self.screen, Screen::UserSearch)
+        {
             self.log_tab = match self.log_tab {
                 LogTab::Activity => LogTab::Daemon,
                 LogTab::Daemon => LogTab::Activity,
@@ -637,12 +1079,142 @@ impl App {
                 }
                 _ => vec![],
             },
-            Popup::Help { .. } | Popup::Error { .. } => {
-                // Any key dismisses help/error popups
+            Popup::GroupPicker { pubkey, selected } => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !self.chats.is_empty() {
+                        *selected = (*selected + 1).min(self.chats.len() - 1);
+                    }
+                    vec![]
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    vec![]
+                }
+                KeyCode::Enter => {
+                    let account = match &self.account {
+                        Some(a) => a.clone(),
+                        None => return vec![],
+                    };
+                    let chat = self.chats.get(*selected).cloned();
+                    let group_id = chat.as_ref().and_then(crate::widget::chat_list::group_id);
+                    let pubkey = pubkey.clone();
+                    self.popup = None;
+                    match group_id {
+                        Some(gid) => vec![Effect::AddMember {
+                            account,
+                            group_id: gid,
+                            npub: pubkey,
+                        }],
+                        None => vec![],
+                    }
+                }
+                KeyCode::Esc => {
+                    self.popup = None;
+                    vec![]
+                }
+                _ => vec![],
+            },
+            Popup::FileBrowser {
+                path,
+                entries,
+                selected,
+            } => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !entries.is_empty() {
+                        *selected = (*selected + 1).min(entries.len() - 1);
+                    }
+                    vec![]
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    vec![]
+                }
+                KeyCode::Char('g') => {
+                    *selected = 0;
+                    vec![]
+                }
+                KeyCode::Char('G') => {
+                    if !entries.is_empty() {
+                        *selected = entries.len() - 1;
+                    }
+                    vec![]
+                }
+                KeyCode::Char('~') => {
+                    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+                    *entries = Self::scan_dir(&home);
+                    *path = home;
+                    *selected = 0;
+                    vec![]
+                }
+                KeyCode::Enter => {
+                    if let Some((name, is_dir)) = entries.get(*selected).cloned() {
+                        if is_dir {
+                            let new_path = path.join(&name);
+                            *entries = Self::scan_dir(&new_path);
+                            *path = new_path;
+                            *selected = 0;
+                        } else {
+                            let file_path = path.join(&name).to_string_lossy().to_string();
+                            self.popup = None;
+                            if let (Some(account), Some(group_id)) =
+                                (&self.account, &self.active_group_id)
+                            {
+                                return vec![Effect::UploadMedia {
+                                    account: account.clone(),
+                                    group_id: group_id.clone(),
+                                    file_path,
+                                }];
+                            }
+                        }
+                    }
+                    vec![]
+                }
+                KeyCode::Backspace | KeyCode::Char('h') => {
+                    if let Some(parent) = path.parent().map(|p| p.to_path_buf()) {
+                        *entries = Self::scan_dir(&parent);
+                        *path = parent;
+                        *selected = 0;
+                    }
+                    vec![]
+                }
+                KeyCode::Esc => {
+                    self.popup = None;
+                    vec![]
+                }
+                _ => vec![],
+            },
+            Popup::Help { .. }
+            | Popup::Error { .. }
+            | Popup::Info { .. }
+            | Popup::UserProfile { .. }
+            | Popup::GroupInfo { .. }
+            | Popup::ImageViewer { .. } => {
+                // Any key dismisses help/error/info/profile/group info/image viewer popups
+                self.popup_image = None;
                 self.popup = None;
                 vec![]
             }
         }
+    }
+
+    fn scan_dir(path: &std::path::Path) -> Vec<(String, bool)> {
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(path) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                entries.push((name, is_dir));
+            }
+        }
+        entries.sort_by(|a, b| match (a.1, b.1) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+        });
+        entries
     }
 
     fn submit_text_input(&mut self, purpose: InputPurpose, value: String) -> Vec<Effect> {
@@ -656,6 +1228,14 @@ impl App {
                 vec![Effect::CreateGroup {
                     account,
                     name: value,
+                    members: vec![],
+                }]
+            }
+            InputPurpose::CreateGroupWithUser { pubkey } => {
+                vec![Effect::CreateGroup {
+                    account,
+                    name: value,
+                    members: vec![pubkey],
                 }]
             }
             InputPurpose::AddMember => {
@@ -681,43 +1261,121 @@ impl App {
                 }]
             }
             InputPurpose::EditProfileName => {
-                vec![Effect::UpdateProfile {
+                vec![Self::profile_update(
                     account,
-                    name: Some(value),
-                    about: None,
-                }]
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )]
+            }
+            InputPurpose::EditDisplayName => {
+                vec![Self::profile_update(
+                    account,
+                    None,
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                    None,
+                )]
             }
             InputPurpose::EditProfileAbout => {
-                vec![Effect::UpdateProfile {
+                vec![Self::profile_update(
                     account,
-                    name: None,
-                    about: Some(value),
-                }]
+                    None,
+                    None,
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                )]
+            }
+            InputPurpose::EditPicture => {
+                vec![Self::profile_update(
+                    account,
+                    None,
+                    None,
+                    None,
+                    Some(value),
+                    None,
+                    None,
+                )]
+            }
+            InputPurpose::EditNip05 => {
+                vec![Self::profile_update(
+                    account,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(value),
+                    None,
+                )]
+            }
+            InputPurpose::EditLud16 => {
+                vec![Self::profile_update(
+                    account,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(value),
+                )]
+            }
+            InputPurpose::ReactionEmoji => {
+                if value.is_empty() {
+                    return vec![];
+                }
+                self.react_to_selected(&value)
             }
         }
     }
 
     fn submit_confirm(&mut self, purpose: ConfirmPurpose) -> Vec<Effect> {
+        if let ConfirmPurpose::Logout { account } = purpose {
+            return vec![Effect::Logout { account }];
+        }
+
         let account = match &self.account {
             Some(a) => a.clone(),
             None => return vec![],
         };
-        let group_id = match &self.viewing_group_id {
-            Some(g) => g.clone(),
-            None => return vec![],
-        };
 
         match purpose {
+            ConfirmPurpose::DeleteMessage { message_id } => {
+                let group_id = match &self.active_group_id {
+                    Some(g) => g.clone(),
+                    None => return vec![],
+                };
+                vec![Effect::DeleteMessage {
+                    account,
+                    group_id,
+                    message_id,
+                }]
+            }
             ConfirmPurpose::LeaveGroup => {
+                let group_id = match &self.viewing_group_id {
+                    Some(g) => g.clone(),
+                    None => return vec![],
+                };
                 vec![Effect::LeaveGroup { account, group_id }]
             }
             ConfirmPurpose::RemoveMember { npub } => {
+                let group_id = match &self.viewing_group_id {
+                    Some(g) => g.clone(),
+                    None => return vec![],
+                };
                 vec![Effect::RemoveMember {
                     account,
                     group_id,
                     npub,
                 }]
             }
+            ConfirmPurpose::Logout { .. } => unreachable!(),
         }
     }
 
@@ -850,10 +1508,19 @@ impl App {
             KeyCode::Char('/') => {
                 self.screen = Screen::UserSearch;
                 self.search_input.clear();
-                self.search_results.clear();
-                self.selected_result = 0;
+                self.clear_search_results();
                 self.search_purpose = SearchPurpose::Browse;
                 vec![]
+            }
+            KeyCode::Char('C') => {
+                self.login_mode = LoginMode::Loading("Creating identity...".into());
+                self.screen = Screen::Login;
+                vec![Effect::CreateIdentity]
+            }
+            KeyCode::Char('A') => {
+                // Switch account — reset UI state and go to account selector
+                // (does NOT call wn logout — just navigates to the picker)
+                self.reset_to_account_select()
             }
             KeyCode::Char('q') => {
                 self.running = false;
@@ -894,19 +1561,216 @@ impl App {
         ]
     }
 
+    /// Currently selected message index, defaulting to the newest.
+    fn selected_msg_index(&self) -> Option<usize> {
+        if self.messages.is_empty() {
+            return None;
+        }
+        match self.selected_message {
+            Some(idx) => Some(idx.min(self.messages.len() - 1)),
+            None => Some(self.messages.len() - 1),
+        }
+    }
+
+    /// Nudge viewport scroll by 1 if the selection moved outside the visible range.
+    fn scroll_to_follow(&mut self, direction: isize) {
+        let sel = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return,
+        };
+        let last = self.messages.len().saturating_sub(1);
+        let bottom_visible = last.saturating_sub(self.message_scroll);
+
+        if direction > 0 && sel > bottom_visible {
+            // Selection below viewport — scroll down by 1
+            self.message_scroll = self.message_scroll.saturating_sub(1);
+        } else if direction < 0 {
+            // Selection moved up — scroll up only if selection is no longer rendered.
+            // The viewport fits ~message_viewport_height rows. Assume each message
+            // averages 1 row (short messages). If selection is more than viewport_height
+            // messages above the bottom, it's likely off-screen.
+            let distance_from_bottom = bottom_visible.saturating_sub(sel);
+            if distance_from_bottom >= self.message_viewport_height {
+                self.message_scroll += 1;
+            }
+        }
+    }
+
+    fn react_to_selected(&self, emoji: &str) -> Vec<Effect> {
+        let (account, group_id) = match (&self.account, &self.active_group_id) {
+            (Some(a), Some(g)) => (a.clone(), g.clone()),
+            _ => return vec![],
+        };
+        let msg_idx = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let message_id = match self.messages[msg_idx].get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return vec![],
+        };
+        vec![Effect::ReactToMessage {
+            account,
+            group_id,
+            message_id,
+            emoji: emoji.to_string(),
+        }]
+    }
+
+    fn unreact_to_selected(&self) -> Vec<Effect> {
+        let (account, group_id) = match (&self.account, &self.active_group_id) {
+            (Some(a), Some(g)) => (a.clone(), g.clone()),
+            _ => return vec![],
+        };
+        let msg_idx = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let message_id = match self.messages[msg_idx].get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return vec![],
+        };
+        vec![Effect::UnreactToMessage {
+            account,
+            group_id,
+            message_id,
+        }]
+    }
+
+    fn delete_selected_message(&mut self) -> Vec<Effect> {
+        let msg_idx = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let msg = &self.messages[msg_idx];
+        // Only allow deleting own messages
+        let author = msg.get("author").and_then(|v| v.as_str()).unwrap_or("");
+        if self.account.as_deref() != Some(author) {
+            return vec![];
+        }
+        let message_id = match msg.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return vec![],
+        };
+        let preview = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect::<String>();
+        self.popup = Some(Popup::Confirm {
+            title: "Delete Message".into(),
+            message: format!("Delete \"{preview}\"?"),
+            purpose: ConfirmPurpose::DeleteMessage { message_id },
+        });
+        vec![]
+    }
+
     fn handle_messages_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match key.code {
             KeyCode::Char('k') | KeyCode::Up => {
-                let max = self.messages.len().saturating_sub(1);
-                self.message_scroll = (self.message_scroll + 1).min(max);
+                // Move selection up (toward older messages)
+                if !self.messages.is_empty() {
+                    let current = self.selected_msg_index().unwrap_or(self.messages.len() - 1);
+                    self.selected_message = Some(current.saturating_sub(1));
+                    self.scroll_to_follow(-1);
+                }
                 vec![]
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.message_scroll = self.message_scroll.saturating_sub(1);
+                // Move selection down (toward newer messages)
+                if !self.messages.is_empty() {
+                    let current = self.selected_msg_index().unwrap_or(self.messages.len() - 1);
+                    let max = self.messages.len() - 1;
+                    self.selected_message = Some((current + 1).min(max));
+                    self.scroll_to_follow(1);
+                }
                 vec![]
             }
             KeyCode::Char('G') => {
-                self.message_scroll = 0;
+                // Jump to newest message
+                if !self.messages.is_empty() {
+                    self.selected_message = Some(self.messages.len() - 1);
+                    self.message_scroll = 0;
+                }
+                vec![]
+            }
+            KeyCode::Char('g') => {
+                // Jump to oldest message
+                if !self.messages.is_empty() {
+                    self.selected_message = Some(0);
+                    self.message_scroll = self.messages.len().saturating_sub(1);
+                }
+                vec![]
+            }
+            KeyCode::Char('r') => {
+                // Open emoji input popup, pre-filled with default reaction
+                let mut input = Input::new();
+                input.insert('+');
+                self.popup = Some(Popup::TextInput {
+                    title: "React with emoji".into(),
+                    input,
+                    purpose: InputPurpose::ReactionEmoji,
+                });
+                vec![]
+            }
+            KeyCode::Char('o') => {
+                // Open first downloaded image attachment in full-size popup
+                if let Some(idx) = self.selected_msg_index() {
+                    if let Some(msg) = self.messages.get(idx) {
+                        for (hash, _, _) in Self::image_attachments(msg) {
+                            if let Some(MediaDownload::Downloaded(path)) =
+                                self.media_downloads.get(&hash)
+                            {
+                                return vec![Effect::LoadMediaPopup {
+                                    file_path: path.clone(),
+                                }];
+                            }
+                        }
+                    }
+                }
+                vec![]
+            }
+            KeyCode::Char('u') => self.unreact_to_selected(),
+            KeyCode::Char('d') => self.delete_selected_message(),
+            KeyCode::Char('U') => {
+                if self.active_group_id.is_some() {
+                    let start = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+                    let entries = Self::scan_dir(&start);
+                    self.popup = Some(Popup::FileBrowser {
+                        path: start,
+                        entries,
+                        selected: 0,
+                    });
+                }
+                vec![]
+            }
+            KeyCode::Char('R') => {
+                // Reply to selected message
+                if let Some(idx) = self.selected_msg_index() {
+                    if let Some(msg) = self.messages.get(idx) {
+                        let event_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if event_id.is_empty() {
+                            return vec![];
+                        }
+                        let author = msg
+                            .get("display_name")
+                            .or_else(|| msg.get("author_name"))
+                            .or_else(|| msg.get("author"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let preview: String = msg
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .chars()
+                            .take(30)
+                            .collect();
+                        self.reply_to = Some((event_id.to_string(), author.to_string(), preview));
+                        self.focus = Panel::Composer;
+                    }
+                }
                 vec![]
             }
             KeyCode::Char('i') | KeyCode::Enter => {
@@ -932,18 +1796,22 @@ impl App {
                     if let (Some(account), Some(group_id)) = (&self.account, &self.active_group_id)
                     {
                         let text = self.composer.value.clone();
+                        let reply_to = self.reply_to.as_ref().map(|(id, _, _)| id.clone());
                         let effect = Effect::SendMessage {
                             account: account.clone(),
                             group_id: group_id.clone(),
                             text,
+                            reply_to,
                         };
                         self.composer.clear();
+                        self.reply_to = None;
                         return vec![effect];
                     }
                 }
                 vec![]
             }
             KeyCode::Esc => {
+                self.reply_to = None;
                 self.focus = Panel::Messages;
                 vec![]
             }
@@ -1002,7 +1870,11 @@ impl App {
 
         self.active_group_id = Some(group_id.clone());
         self.messages.clear();
+        self.media_downloads.clear();
+        self.inline_images.clear();
+        self.reply_to = None;
         self.message_scroll = 0;
+        self.selected_message = None;
         self.focus = Panel::Messages;
         self.unread_counts.remove(&group_id);
 
@@ -1042,8 +1914,7 @@ impl App {
                 };
                 self.screen = Screen::UserSearch;
                 self.search_input.clear();
-                self.search_results.clear();
-                self.selected_result = 0;
+                self.clear_search_results();
                 self.search_purpose = SearchPurpose::AddMember { group_id };
                 vec![]
             }
@@ -1053,6 +1924,14 @@ impl App {
                     input: Input::new(),
                     purpose: InputPurpose::AddMember,
                 });
+                vec![]
+            }
+            KeyCode::Char('i') => {
+                if let Some(detail) = &self.group_detail {
+                    self.popup = Some(Popup::GroupInfo {
+                        data: detail.clone(),
+                    });
+                }
                 vec![]
             }
             KeyCode::Char('x') => self.confirm_remove_member(),
@@ -1127,6 +2006,21 @@ impl App {
 
     // ── Profile key handling ─────────────────────────────────────────
 
+    fn open_profile_edit(&mut self, title: &str, field: &str, purpose: InputPurpose) {
+        if let Some(profile) = &self.profile {
+            let current = profile.get(field).and_then(|v| v.as_str()).unwrap_or("");
+            let mut input = Input::new();
+            for ch in current.chars() {
+                input.insert(ch);
+            }
+            self.popup = Some(Popup::TextInput {
+                title: title.into(),
+                input,
+                purpose,
+            });
+        }
+    }
+
     fn handle_profile_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match key.code {
             KeyCode::Esc => {
@@ -1135,44 +2029,57 @@ impl App {
                 vec![]
             }
             KeyCode::Char('n') => {
-                if self.profile.is_some() {
-                    let current = self
-                        .profile
-                        .as_ref()
-                        .and_then(|p| p.get("name").or_else(|| p.get("display_name")))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let mut input = Input::new();
-                    for ch in current.chars() {
-                        input.insert(ch);
-                    }
-                    self.popup = Some(Popup::TextInput {
-                        title: "Edit Name".into(),
-                        input,
-                        purpose: InputPurpose::EditProfileName,
-                    });
-                }
+                self.open_profile_edit("Edit Name", "name", InputPurpose::EditProfileName);
+                vec![]
+            }
+            KeyCode::Char('D') => {
+                self.open_profile_edit(
+                    "Edit Display Name",
+                    "display_name",
+                    InputPurpose::EditDisplayName,
+                );
                 vec![]
             }
             KeyCode::Char('a') => {
-                if self.profile.is_some() {
-                    let current = self
-                        .profile
-                        .as_ref()
-                        .and_then(|p| p.get("about"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let mut input = Input::new();
-                    for ch in current.chars() {
-                        input.insert(ch);
-                    }
-                    self.popup = Some(Popup::TextInput {
-                        title: "Edit About".into(),
-                        input,
-                        purpose: InputPurpose::EditProfileAbout,
-                    });
-                }
+                self.open_profile_edit("Edit About", "about", InputPurpose::EditProfileAbout);
                 vec![]
+            }
+            KeyCode::Char('P') => {
+                self.open_profile_edit("Edit Picture URL", "picture", InputPurpose::EditPicture);
+                vec![]
+            }
+            KeyCode::Char('5') => {
+                self.open_profile_edit("Edit NIP-05", "nip05", InputPurpose::EditNip05);
+                vec![]
+            }
+            KeyCode::Char('$') => {
+                self.open_profile_edit("Edit Lightning Address", "lud16", InputPurpose::EditLud16);
+                vec![]
+            }
+            KeyCode::Char('e') => {
+                let account = match &self.account {
+                    Some(a) => a.clone(),
+                    None => return vec![],
+                };
+                vec![Effect::ExportNsec { account }]
+            }
+            KeyCode::Enter => {
+                let account = match &self.account {
+                    Some(a) => a.clone(),
+                    None => return vec![],
+                };
+                let pubkey = self
+                    .follows
+                    .get(self.selected_follow)
+                    .and_then(|f| f.get("pubkey").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string());
+                match pubkey {
+                    Some(pk) => vec![Effect::ShowUserProfile {
+                        account,
+                        pubkey: pk,
+                    }],
+                    None => vec![],
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if !self.follows.is_empty() {
@@ -1203,6 +2110,18 @@ impl App {
                     None => vec![],
                 }
             }
+            KeyCode::Char('Q') => {
+                let account = match &self.account {
+                    Some(a) => a.clone(),
+                    None => return vec![],
+                };
+                self.popup = Some(Popup::Confirm {
+                    title: "Logout".into(),
+                    message: "Log out of this account? (y/n)".into(),
+                    purpose: ConfirmPurpose::Logout { account },
+                });
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -1231,8 +2150,7 @@ impl App {
                 };
                 self.screen = back_screen;
                 self.search_input.clear();
-                self.search_results.clear();
-                self.selected_result = 0;
+                self.clear_search_results();
                 vec![Effect::UnsubscribeSearch]
             }
             KeyCode::Enter => {
@@ -1256,8 +2174,7 @@ impl App {
                         // Go back to group detail
                         self.screen = Screen::GroupDetail;
                         self.search_input.clear();
-                        self.search_results.clear();
-                        self.selected_result = 0;
+                        self.clear_search_results();
                         return vec![
                             Effect::UnsubscribeSearch,
                             Effect::AddMember {
@@ -1276,8 +2193,7 @@ impl App {
                         None => return vec![],
                     };
                     let query = self.search_input.value.clone();
-                    self.search_results.clear();
-                    self.selected_result = 0;
+                    self.clear_search_results();
                     vec![Effect::SearchUsers { account, query }]
                 } else {
                     vec![]
@@ -1295,6 +2211,45 @@ impl App {
                 vec![]
             }
             KeyCode::Tab => self.toggle_follow_selected(),
+            KeyCode::F(2) => {
+                // Show selected user's profile
+                let account = match &self.account {
+                    Some(a) => a.clone(),
+                    None => return vec![],
+                };
+                match self.selected_search_pubkey() {
+                    Some(pk) => vec![Effect::ShowUserProfile {
+                        account,
+                        pubkey: pk,
+                    }],
+                    None => vec![],
+                }
+            }
+            KeyCode::F(3) => {
+                // Create group with selected user
+                let pubkey = self.selected_search_pubkey();
+                if let Some(pk) = pubkey {
+                    self.popup = Some(Popup::TextInput {
+                        title: "Create Group with User".into(),
+                        input: Input::new(),
+                        purpose: InputPurpose::CreateGroupWithUser { pubkey: pk },
+                    });
+                }
+                vec![]
+            }
+            KeyCode::F(4) => {
+                // Add selected user to existing group
+                let pubkey = self.selected_search_pubkey();
+                if let Some(pk) = pubkey {
+                    if !self.chats.is_empty() {
+                        self.popup = Some(Popup::GroupPicker {
+                            pubkey: pk,
+                            selected: 0,
+                        });
+                    }
+                }
+                vec![]
+            }
             KeyCode::Char(ch) => {
                 self.search_input.insert(ch);
                 vec![]
@@ -1327,6 +2282,17 @@ impl App {
         }
     }
 
+    fn selected_search_pubkey(&self) -> Option<String> {
+        self.search_results
+            .get(self.selected_result)
+            .and_then(|u| {
+                u.get("pubkey")
+                    .or_else(|| u.get("npub"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.to_string())
+    }
+
     fn toggle_follow_selected(&mut self) -> Vec<Effect> {
         let account = match &self.account {
             Some(a) => a.clone(),
@@ -1346,8 +2312,10 @@ impl App {
         };
 
         if self.is_following(&pubkey) {
+            self.follow_checks.insert(pubkey.clone(), false);
             vec![Effect::UnfollowUser { account, pubkey }]
         } else {
+            self.follow_checks.insert(pubkey.clone(), true);
             vec![Effect::FollowUser { account, pubkey }]
         }
     }
@@ -1375,6 +2343,38 @@ impl App {
                     } else {
                         vec![]
                     }
+                }
+                KeyCode::Char('c') => {
+                    self.login_mode = LoginMode::Loading("Creating identity...".into());
+                    self.status_message = None;
+                    vec![Effect::CreateIdentity]
+                }
+                KeyCode::Char('d') => {
+                    let idx = *selected;
+                    if let Some(account_id) = accounts.get(idx).and_then(extract_account_id) {
+                        let name = accounts
+                            .get(idx)
+                            .and_then(|a| {
+                                a.get("display_name")
+                                    .or_else(|| a.get("name"))
+                                    .and_then(|v| v.as_str())
+                            })
+                            .unwrap_or("this account");
+                        self.popup = Some(Popup::Confirm {
+                            title: "Logout".into(),
+                            message: format!("Log out of \"{name}\"? (y/n)"),
+                            purpose: ConfirmPurpose::Logout {
+                                account: account_id,
+                            },
+                        });
+                    }
+                    vec![]
+                }
+                KeyCode::Char('l') => {
+                    self.login_mode = LoginMode::NsecInput;
+                    self.nsec_input.clear();
+                    self.status_message = None;
+                    vec![]
                 }
                 KeyCode::Char('q') => {
                     self.running = false;
@@ -1454,24 +2454,50 @@ impl App {
 
     // ── Drawing ──────────────────────────────────────────────────────
 
-    pub fn draw(&self, frame: &mut Frame) {
-        let area = frame.area();
+    pub fn draw(&mut self, frame: &mut Frame) {
+        use ratatui::layout::{Constraint, Layout};
+
+        let full_area = frame.area();
+
+        // Split for log panel (shown on non-main screens; main screen handles its own)
+        let show_global_logs = self.show_logs && self.screen != Screen::Main;
+        let log_height = if show_global_logs {
+            (full_area.height / 3).max(5)
+        } else {
+            0
+        };
+        let vertical = Layout::vertical([Constraint::Fill(1), Constraint::Length(log_height)])
+            .split(full_area);
+        let area = vertical[0];
+
+        // Update message viewport height estimate for scroll calculations
+        if self.screen == Screen::Main {
+            // full_area minus: log panel, hints (1), status bar (1), borders (2), composer (~5)
+            let chrome = log_height + 1 + 1 + 2 + 5;
+            self.message_viewport_height =
+                (full_area.height.saturating_sub(chrome) as usize).max(3);
+        }
+
         match &self.screen {
             Screen::Login => crate::screen::login::draw(self, frame, area),
-            Screen::Main => crate::screen::main_screen::draw(self, frame, area),
+            Screen::Main => crate::screen::main_screen::draw(self, frame, full_area),
             Screen::GroupDetail => crate::screen::group_detail::draw(self, frame, area),
             Screen::Profile => crate::screen::profile::draw(self, frame, area),
             Screen::Settings => crate::screen::settings::draw(self, frame, area),
             Screen::UserSearch => crate::screen::user_search::draw(self, frame, area),
         }
 
+        if show_global_logs {
+            crate::screen::main_screen::draw_log_panel(self, frame, vertical[1]);
+        }
+
         // Popup overlay (renders on top of any screen)
-        if let Some(popup) = &self.popup {
-            self.draw_popup(popup, frame, area);
+        if let Some(popup) = self.popup.clone() {
+            self.draw_popup(&popup, frame, full_area);
         }
     }
 
-    fn draw_popup(&self, popup: &Popup, frame: &mut Frame, area: ratatui::layout::Rect) {
+    fn draw_popup(&mut self, popup: &Popup, frame: &mut Frame, area: ratatui::layout::Rect) {
         use crate::widget::popup::PopupWidget;
         use ratatui::style::{Color, Style};
         use ratatui::text::{Line, Span};
@@ -1519,6 +2545,225 @@ impl App {
                     .size(55, 8);
                 frame.render_widget(widget, area);
             }
+            Popup::Info { title, message } => {
+                let widget = PopupWidget::new(title)
+                    .body(vec![
+                        Line::raw(""),
+                        Line::from(Span::styled(
+                            message.as_str(),
+                            Style::default().fg(Color::Yellow),
+                        )),
+                    ])
+                    .hints(vec![("Any key", "Dismiss")])
+                    .size(70, 8);
+                frame.render_widget(widget, area);
+            }
+            Popup::UserProfile { data } => {
+                use crate::widget::popup::centered_rect;
+                use ratatui::widgets::{Paragraph, Wrap};
+
+                let meta = data.get("metadata");
+                let f = |key: &str| -> &str {
+                    meta.and_then(|m| m.get(key))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(not set)")
+                };
+                let pubkey = data.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");
+                let npub = if pubkey.is_empty() {
+                    "(unknown)".to_string()
+                } else {
+                    hex_to_npub(pubkey)
+                };
+                let label = Style::default().fg(Color::DarkGray);
+                let val = Style::default().fg(Color::White);
+
+                let has_image = self.popup_image.is_some();
+                let img_cols = if has_image { 20u16 } else { 0 };
+                let popup_width = if has_image { 90 } else { 70 };
+
+                let body_lines = vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("  Name:          ", label),
+                        Span::styled(f("name"), val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Display Name:  ", label),
+                        Span::styled(f("display_name"), val),
+                    ]),
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("  About:         ", label),
+                        Span::styled(f("about"), val),
+                    ]),
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("  Picture:       ", label),
+                        Span::styled(f("picture"), val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Website:       ", label),
+                        Span::styled(f("website"), val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  NIP-05:        ", label),
+                        Span::styled(f("nip05"), val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Lightning:     ", label),
+                        Span::styled(f("lud16"), val),
+                    ]),
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("  npub:          ", label),
+                        Span::styled(&npub, val),
+                    ]),
+                ];
+                let body_height = body_lines.len() as u16;
+                let height = (body_height + 4).min(22);
+
+                // Render popup frame with empty body — we'll place text manually
+                let widget = PopupWidget::new("User Profile")
+                    .hints(vec![("Any key", "Close")])
+                    .size(popup_width, height);
+                frame.render_widget(widget, area);
+
+                // Compute popup inner area for manual content placement
+                let popup_area = centered_rect(popup_width, height, area);
+                let inner = ratatui::layout::Rect::new(
+                    popup_area.x + 1,
+                    popup_area.y + 1,
+                    popup_area.width.saturating_sub(2),
+                    popup_area.height.saturating_sub(2),
+                );
+
+                // Text area: offset by image columns so wrapping stays in bounds
+                let text_area = ratatui::layout::Rect::new(
+                    inner.x + img_cols,
+                    inner.y,
+                    inner.width.saturating_sub(img_cols),
+                    inner.height.saturating_sub(1), // leave room for hints
+                );
+                frame.render_widget(
+                    Paragraph::new(body_lines).wrap(Wrap { trim: false }),
+                    text_area,
+                );
+
+                // Render image on the left side
+                if let Some(proto) = &mut self.popup_image {
+                    use ratatui_image::StatefulImage;
+                    let img_h = inner.height.saturating_sub(2);
+                    if img_cols > 0 && img_h > 0 {
+                        let img_area = ratatui::layout::Rect::new(
+                            inner.x,
+                            inner.y + 1, // skip the empty first line
+                            img_cols,
+                            img_h,
+                        );
+                        frame.render_stateful_widget(StatefulImage::default(), img_area, proto);
+                    }
+                }
+            }
+            Popup::GroupInfo { data } => {
+                let label = Style::default().fg(Color::DarkGray);
+                let val = Style::default().fg(Color::White);
+
+                let name = data
+                    .get("name")
+                    .or_else(|| data.get("group_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)");
+                let description = data
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("(none)");
+                let state = data
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let epoch = data
+                    .get("epoch")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into());
+
+                let to_hex_display = |val: &Value| -> String {
+                    crate::util::value_to_hex(val).unwrap_or_else(|| "(unavailable)".into())
+                };
+                let mls_id = data
+                    .get("mls_group_id")
+                    .map(to_hex_display)
+                    .unwrap_or_else(|| "(unavailable)".into());
+                let nostr_id = data
+                    .get("nostr_group_id")
+                    .map(to_hex_display)
+                    .unwrap_or_else(|| "(unavailable)".into());
+
+                let admin_count = data
+                    .get("admin_pubkeys")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+
+                let last_msg = data
+                    .get("last_message_at")
+                    .and_then(|v| v.as_i64())
+                    .map(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0)
+                            .map(|dt| {
+                                dt.with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| ts.to_string())
+                    })
+                    .unwrap_or_else(|| "(none)".into());
+
+                let body = vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("  Name:           ", label),
+                        Span::styled(name, val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Description:    ", label),
+                        Span::styled(description, val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  State:          ", label),
+                        Span::styled(state, val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Epoch:          ", label),
+                        Span::styled(&epoch, val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Admins:         ", label),
+                        Span::styled(admin_count.to_string(), val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Last message:   ", label),
+                        Span::styled(&last_msg, val),
+                    ]),
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("  MLS Group ID:   ", label),
+                        Span::styled(&mls_id, val),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Nostr Group ID: ", label),
+                        Span::styled(&nostr_id, val),
+                    ]),
+                ];
+                let height = (body.len() as u16 + 4).min(22);
+                let widget = PopupWidget::new("Group Info")
+                    .body(body)
+                    .hints(vec![("Any key", "Close")])
+                    .size(75, height);
+                frame.render_widget(widget, area);
+            }
             Popup::Invites { items, selected } => {
                 let body: Vec<Line> = items
                     .iter()
@@ -1542,6 +2787,186 @@ impl App {
                     .body(body)
                     .hints(vec![("a", "Accept"), ("d", "Decline"), ("Esc", "Close")])
                     .size(50, height);
+                frame.render_widget(widget, area);
+            }
+            Popup::GroupPicker { selected, .. } => {
+                let body: Vec<Line> = if self.chats.is_empty() {
+                    vec![Line::styled(
+                        "  No groups available",
+                        Style::default().fg(Color::DarkGray),
+                    )]
+                } else {
+                    self.chats
+                        .iter()
+                        .enumerate()
+                        .map(|(i, chat)| {
+                            let name = chat
+                                .get("name")
+                                .or_else(|| chat.get("group_name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown");
+                            let marker = if i == *selected { ">" } else { " " };
+                            let style = if i == *selected {
+                                Style::default().fg(Color::Cyan)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+                            Line::from(vec![
+                                Span::styled(
+                                    format!("  {marker} "),
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(name.to_string(), style),
+                            ])
+                        })
+                        .collect()
+                };
+                let height = (body.len() as u16 + 5).min(20);
+                let widget = PopupWidget::new("Add to Group")
+                    .body(body)
+                    .hints(vec![
+                        ("Enter", "Add"),
+                        ("j/k", "Navigate"),
+                        ("Esc", "Cancel"),
+                    ])
+                    .size(50, height);
+                frame.render_widget(widget, area);
+            }
+            Popup::ImageViewer {
+                img_width,
+                img_height,
+            } => {
+                use crate::widget::popup::centered_rect;
+                use ratatui::layout::Rect;
+                use ratatui::widgets::{Block, Paragraph};
+                use ratatui_image::StatefulImage;
+
+                // Size popup to image aspect ratio.
+                // Terminal cells are ~2:1 (twice as tall as wide), so divide
+                // pixel height by 2 when converting to cell rows.
+                let max_w = area.width.saturating_sub(4);
+                let max_h = area.height.saturating_sub(4);
+                let aspect = *img_width as f64 / (*img_height).max(1) as f64;
+
+                // Start with max width, compute height from aspect ratio
+                // cell_height = pixel_height / 2 relative to width
+                let mut w = max_w;
+                let mut h = (w as f64 / aspect / 2.0).ceil() as u16;
+
+                // If height exceeds max, scale down from height instead
+                if h > max_h {
+                    h = max_h;
+                    w = (h as f64 * aspect * 2.0).ceil() as u16;
+                }
+
+                // Add 2 for borders + 1 for hint line
+                let popup_w = (w + 2).min(area.width);
+                let popup_h = (h + 3).min(area.height);
+                let popup_area = centered_rect(popup_w, popup_h, area);
+
+                let block = Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Image Viewer ");
+                let inner = block.inner(popup_area);
+
+                // Clear background
+                frame.render_widget(ratatui::widgets::Clear, popup_area);
+                frame.render_widget(block, popup_area);
+
+                if let Some(proto) = &mut self.popup_image {
+                    if inner.width > 0 && inner.height > 1 {
+                        let img_area = Rect::new(
+                            inner.x,
+                            inner.y,
+                            inner.width,
+                            inner.height.saturating_sub(1),
+                        );
+                        frame.render_stateful_widget(StatefulImage::default(), img_area, proto);
+                    }
+                }
+
+                // Hint at bottom
+                let hint_area = Rect::new(
+                    inner.x,
+                    inner.y + inner.height.saturating_sub(1),
+                    inner.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            " Any key ",
+                            Style::default().fg(Color::Black).bg(Color::DarkGray),
+                        ),
+                        Span::styled(" Close", Style::default().fg(Color::DarkGray)),
+                    ])),
+                    hint_area,
+                );
+            }
+            Popup::FileBrowser {
+                path,
+                entries,
+                selected,
+            } => {
+                let title = {
+                    let p = path.display().to_string();
+                    if p.len() > 56 {
+                        format!("...{}", &p[p.len() - 53..])
+                    } else {
+                        p
+                    }
+                };
+                let body: Vec<Line> = if entries.is_empty() {
+                    vec![Line::styled(
+                        "  (empty directory)",
+                        Style::default().fg(Color::DarkGray),
+                    )]
+                } else {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, is_dir))| {
+                            let marker = if i == *selected { ">" } else { " " };
+                            let display = if *is_dir {
+                                format!("{name}/")
+                            } else {
+                                name.clone()
+                            };
+                            let style = if i == *selected {
+                                if *is_dir {
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(ratatui::style::Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::Cyan)
+                                }
+                            } else if *is_dir {
+                                Style::default().fg(Color::Blue)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+                            Line::from(vec![
+                                Span::styled(
+                                    format!("  {marker} "),
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(display, style),
+                            ])
+                        })
+                        .collect()
+                };
+                let height = (body.len() as u16 + 5).min(20);
+                let widget = PopupWidget::new(&title)
+                    .body(body)
+                    .hints(vec![
+                        ("Enter", "Open"),
+                        ("j/k", "Navigate"),
+                        ("Bksp", "Parent"),
+                        ("~", "Home"),
+                        ("Esc", "Cancel"),
+                    ])
+                    .size(60, height);
                 frame.render_widget(widget, area);
             }
         }
@@ -1597,6 +3022,8 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("Enter", "Select chat"));
             lines.push(hint("Tab", "Switch focus"));
             lines.push(hint("i / Enter", "Start typing (messages)"));
+            lines.push(hint("r", "React to message"));
+            lines.push(hint("u", "Unreact"));
             lines.push(hint("Esc", "Unfocus / back"));
             lines.push(hint("n", "New group"));
             lines.push(hint("g", "Group info"));
@@ -1614,14 +3041,22 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("A", "Add by pubkey/npub"));
             lines.push(hint("x", "Remove member"));
             lines.push(hint("R", "Rename group"));
+            lines.push(hint("i", "Group info (epoch, IDs)"));
             lines.push(hint("L", "Leave group"));
             lines.push(hint("Esc", "Back"));
         }
         Screen::Profile => {
             lines.push(hint("n", "Edit name"));
+            lines.push(hint("D", "Edit display name"));
             lines.push(hint("a", "Edit about"));
+            lines.push(hint("P", "Edit picture URL"));
+            lines.push(hint("5", "Edit NIP-05"));
+            lines.push(hint("$", "Edit lightning address"));
+            lines.push(hint("e", "Show nsec"));
             lines.push(hint("j / k", "Navigate follows"));
+            lines.push(hint("Enter", "View profile"));
             lines.push(hint("d", "Unfollow"));
+            lines.push(hint("Q", "Logout"));
             lines.push(hint("Esc", "Back"));
         }
         Screen::Settings => {
@@ -1636,6 +3071,9 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("Enter", "Search"));
             lines.push(hint("↑ / ↓", "Navigate results"));
             lines.push(hint("Tab", "Follow / Unfollow"));
+            lines.push(hint("F2", "View profile"));
+            lines.push(hint("F3", "New group with user"));
+            lines.push(hint("F4", "Add to existing group"));
             lines.push(hint("Esc", "Back"));
         }
     }
@@ -1927,6 +3365,22 @@ mod tests {
         assert_eq!(app.messages.len(), 0);
     }
 
+    #[test]
+    fn message_update_skips_reaction_and_deletion_events() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.update(msg_update(
+            json!({"id": "msg1", "content": "hello", "kind": 9}),
+        ));
+        app.update(msg_update(json!({"id": "r1", "content": "+", "kind": 7})));
+        app.update(msg_update(json!({"id": "d1", "content": "", "kind": 5})));
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "Only kind-9 chat messages should be kept"
+        );
+    }
+
     // ── Notifications ────────────────────────────────────────────────
 
     #[test]
@@ -2131,6 +3585,24 @@ mod tests {
     }
 
     #[test]
+    fn leave_group_removes_from_chat_list() {
+        let mut app = app_on_group_detail();
+        app.chats = vec![
+            json!({"name": "Other", "mls_group_id": "other1"}),
+            json!({"name": "Coffee Chat", "mls_group_id": "g1"}),
+            json!({"name": "Third", "mls_group_id": "g3"}),
+        ];
+        app.selected_chat = 1;
+        app.update(Action::GroupActionSuccess("Left group".into()));
+        assert_eq!(app.chats.len(), 2);
+        assert!(app
+            .chats
+            .iter()
+            .all(|c| chat_list::group_id(c).as_deref() != Some("g1")));
+        assert!(app.selected_chat < app.chats.len());
+    }
+
+    #[test]
     fn group_action_success_reloads_detail() {
         let mut app = app_on_group_detail();
         let effects = app.update(Action::GroupActionSuccess("Member added".into()));
@@ -2245,6 +3717,38 @@ mod tests {
         ));
         assert!(app.profile.is_some());
         assert_eq!(app.profile.as_ref().unwrap()["name"], "Alice");
+    }
+
+    #[test]
+    fn profile_loaded_with_picture_emits_fetch() {
+        let mut app = app_on_main();
+        app.screen = Screen::Profile;
+        let effects = app.update(Action::ProfileLoaded(
+            json!({"name": "Alice", "picture": "https://example.com/pic.jpg"}),
+        ));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::FetchProfileImage { .. })));
+    }
+
+    #[test]
+    fn profile_loaded_without_picture_no_fetch() {
+        let mut app = app_on_main();
+        app.screen = Screen::Profile;
+        let effects = app.update(Action::ProfileLoaded(
+            json!({"name": "Alice", "about": "Hi"}),
+        ));
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, Effect::FetchProfileImage { .. })));
+    }
+
+    #[test]
+    fn profile_image_fetched_without_picker_is_noop() {
+        let mut app = app_on_main();
+        app.picker = None;
+        app.update(Action::ProfileImageFetched(vec![0, 1, 2]));
+        assert!(app.profile_image.is_none());
     }
 
     #[test]
@@ -2473,6 +3977,21 @@ mod tests {
         ];
         app.update(Action::Key(key(KeyCode::Char('j'))));
         assert_eq!(app.selected_follow, 1);
+    }
+
+    #[test]
+    fn profile_enter_views_selected_follow() {
+        let mut app = app_on_main();
+        app.screen = Screen::Profile;
+        app.follows = vec![
+            json!({"pubkey": "abc", "name": "Alice"}),
+            json!({"pubkey": "def", "name": "Bob"}),
+        ];
+        app.selected_follow = 1;
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::ShowUserProfile { ref pubkey, .. } if pubkey == "def")));
     }
 
     #[test]
@@ -2732,6 +4251,122 @@ mod tests {
         assert_eq!(app.message_scroll, 0, "should auto-scroll");
     }
 
+    // ── Reactions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn react_opens_emoji_popup() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![
+            json!({"id": "msg1", "content": "hello", "author": "a"}),
+            json!({"id": "msg2", "content": "world", "author": "b"}),
+        ];
+        app.update(Action::Key(key(KeyCode::Char('r'))));
+        match &app.popup {
+            Some(Popup::TextInput { purpose, input, .. }) => {
+                assert_eq!(*purpose, InputPurpose::ReactionEmoji);
+                assert_eq!(input.value, "+"); // pre-filled with default
+            }
+            other => panic!("Expected TextInput popup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn react_submit_emits_effect() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({"id": "msg1", "content": "hello", "author": "a"})];
+        app.selected_message = Some(0);
+        // Open popup and submit
+        app.update(Action::Key(key(KeyCode::Char('r'))));
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ReactToMessage { ref message_id, ref emoji, .. }
+            if message_id == "msg1" && emoji == "+"
+        )));
+    }
+
+    #[test]
+    fn k_moves_selection_up() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![
+            json!({"id": "msg1", "content": "a", "author": "a"}),
+            json!({"id": "msg2", "content": "b", "author": "a"}),
+            json!({"id": "msg3", "content": "c", "author": "a"}),
+        ];
+        // Default: no selection = newest (index 2)
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        assert_eq!(app.selected_message, Some(1));
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        assert_eq!(app.selected_message, Some(0));
+        // Clamps at 0
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        assert_eq!(app.selected_message, Some(0));
+    }
+
+    #[test]
+    fn j_moves_selection_down() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![
+            json!({"id": "msg1", "content": "a", "author": "a"}),
+            json!({"id": "msg2", "content": "b", "author": "a"}),
+        ];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.selected_message, Some(1));
+        // Clamps at max
+        app.update(Action::Key(key(KeyCode::Char('j'))));
+        assert_eq!(app.selected_message, Some(1));
+    }
+
+    #[test]
+    fn unreact_emits_effect() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({"id": "msg1", "content": "hi", "author": "a"})];
+        app.message_scroll = 0;
+        let effects = app.update(Action::Key(key(KeyCode::Char('u'))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::UnreactToMessage { ref message_id, .. } if message_id == "msg1"
+        )));
+    }
+
+    #[test]
+    fn react_with_no_messages_is_noop() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![];
+        let effects = app.update(Action::Key(key(KeyCode::Char('r'))));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn react_without_group_is_noop() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = None;
+        app.messages = vec![json!({"id": "msg1", "content": "hi", "author": "a"})];
+        let effects = app.update(Action::Key(key(KeyCode::Char('r'))));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn reaction_error_shows_popup() {
+        let mut app = app_on_main();
+        app.update(Action::ReactionError("fail".into()));
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
+    }
+
     // ── Invite popup navigation ──────────────────────────────────────
 
     #[test]
@@ -2927,5 +4562,590 @@ mod tests {
         app.focus = Panel::ChatList;
         app.update(Action::Paste("should be ignored".into()));
         assert!(app.composer.is_empty());
+    }
+
+    // ── Media / image_attachments tests ─────────────────────────────
+
+    #[test]
+    fn image_attachments_extracts_image_hashes() {
+        let msg = json!({
+            "content": "check this",
+            "media_attachments": [
+                {
+                    "file_hash": "abc123",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "abc123");
+        assert_eq!(result[0].1, "image/png");
+        assert_eq!(result[0].2, "photo.png");
+    }
+
+    #[test]
+    fn image_attachments_skips_non_images() {
+        let msg = json!({
+            "content": "file here",
+            "media_attachments": [
+                {
+                    "file_hash": "abc123",
+                    "mime_type": "application/pdf",
+                    "filename": "doc.pdf"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn image_attachments_handles_byte_vec_hash() {
+        let msg = json!({
+            "content": "img",
+            "media_attachments": [
+                {
+                    "file_hash": {"value": {"vec": [0xab, 0xcd, 0xef]}},
+                    "mime_type": "image/jpeg",
+                    "filename": "img.jpg"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "abcdef");
+    }
+
+    #[test]
+    fn image_attachments_real_cli_format() {
+        // Matches actual `wn messages list --json` output (verified 2026-03-07)
+        let msg = json!({
+            "content": "",
+            "kind": 9,
+            "media_attachments": [
+                {
+                    "account_pubkey": "abc123",
+                    "blossom_url": "https://blossom.primal.net/d012c620",
+                    "mime_type": "image/jpeg",
+                    "original_file_hash": [234, 240, 211, 181],
+                    "encrypted_file_hash": [208, 18, 198, 32],
+                    "file_metadata": {
+                        "original_filename": "signal-2026-03-03.jpeg"
+                    },
+                    "file_path": "",
+                    "media_type": "chat_media"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 1, "Should find 1 image attachment");
+        assert_eq!(result[0].0, "eaf0d3b5", "Hash should be hex of byte array");
+        assert_eq!(result[0].1, "image/jpeg");
+        assert_eq!(
+            result[0].2, "signal-2026-03-03.jpeg",
+            "Should use original_filename"
+        );
+    }
+
+    #[test]
+    fn image_attachments_empty_when_no_attachments() {
+        let msg = json!({"content": "hello"});
+        assert!(App::image_attachments(&msg).is_empty());
+    }
+
+    #[test]
+    fn image_attachments_mixed_types() {
+        let msg = json!({
+            "content": "mixed",
+            "media_attachments": [
+                {
+                    "file_hash": "hash1",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                },
+                {
+                    "file_hash": "hash2",
+                    "mime_type": "application/zip",
+                    "filename": "archive.zip"
+                },
+                {
+                    "file_hash": "hash3",
+                    "mime_type": "image/gif",
+                    "filename": "anim.gif"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "hash1");
+        assert_eq!(result[1].0, "hash3");
+    }
+
+    #[test]
+    fn media_downloaded_updates_state() {
+        let mut app = app_on_main();
+        app.media_downloads
+            .insert("hash1".into(), MediaDownload::Downloading);
+        app.update(Action::MediaDownloaded {
+            file_hash: "hash1".into(),
+            file_path: "/tmp/img.png".into(),
+        });
+        assert!(matches!(
+            app.media_downloads.get("hash1"),
+            Some(MediaDownload::Downloaded(p)) if p == "/tmp/img.png"
+        ));
+    }
+
+    #[test]
+    fn media_download_failed_updates_state() {
+        let mut app = app_on_main();
+        app.media_downloads
+            .insert("hash1".into(), MediaDownload::Downloading);
+        app.update(Action::MediaDownloadFailed {
+            file_hash: "hash1".into(),
+            error: "not found".into(),
+        });
+        assert!(matches!(
+            app.media_downloads.get("hash1"),
+            Some(MediaDownload::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn select_chat_clears_media_downloads() {
+        let mut app = app_on_main();
+        app.chats = vec![json!({"name": "test", "mls_group_id": "aabb"})];
+        app.media_downloads
+            .insert("hash1".into(), MediaDownload::Downloading);
+        app.selected_chat = 0;
+        app.active_group_id = Some("other".into());
+        app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(app.media_downloads.is_empty());
+    }
+
+    #[test]
+    fn message_update_triggers_download_for_image() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        let msg = json!({
+            "id": "m1",
+            "kind": 9,
+            "content": "look",
+            "author": "a",
+            "media_attachments": [
+                {
+                    "file_hash": "imghash",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                }
+            ]
+        });
+        let effects = app.update(Action::MessageUpdate {
+            group_id: "g1".into(),
+            message: msg,
+        });
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::DownloadMedia { ref file_hash, .. } if file_hash == "imghash")
+        ));
+        assert!(matches!(
+            app.media_downloads.get("imghash"),
+            Some(MediaDownload::Downloading)
+        ));
+    }
+
+    #[test]
+    fn o_opens_image_when_downloaded() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "m1",
+            "content": "img",
+            "author": "a",
+            "media_attachments": [
+                {
+                    "file_hash": "imghash",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                }
+            ]
+        })];
+        app.selected_message = Some(0);
+        app.media_downloads.insert(
+            "imghash".into(),
+            MediaDownload::Downloaded("/tmp/photo.png".into()),
+        );
+        let effects = app.update(Action::Key(key(KeyCode::Char('o'))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::LoadMediaPopup {
+                ref file_path,
+                ..
+            } if file_path == "/tmp/photo.png"
+        )));
+    }
+
+    #[test]
+    fn o_noop_when_no_image_downloaded() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "m1",
+            "content": "text only",
+            "author": "a"
+        })];
+        app.selected_message = Some(0);
+        let effects = app.update(Action::Key(key(KeyCode::Char('o'))));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn switch_account_resets_state_and_checks_accounts() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.chats = vec![json!({"name": "test"})];
+        app.messages = vec![json!({"content": "hi"})];
+        app.focus = Panel::ChatList;
+        let effects = app.update(Action::Key(key(KeyCode::Char('A'))));
+        assert_eq!(app.screen, Screen::Login);
+        assert!(app.account.is_none());
+        assert!(app.chats.is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.active_group_id.is_none());
+        assert!(effects.iter().any(|e| matches!(e, Effect::CheckAccounts)));
+    }
+
+    #[test]
+    fn d_opens_confirm_for_own_message() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("mypub".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "msg1",
+            "content": "my message",
+            "author": "mypub"
+        })];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('d'))));
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Confirm {
+                purpose: ConfirmPurpose::DeleteMessage { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn d_noop_for_others_message() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("mypub".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "msg1",
+            "content": "their message",
+            "author": "otherpub"
+        })];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('d'))));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn confirm_delete_emits_effect() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::Confirm {
+            title: "Delete".into(),
+            message: "Delete?".into(),
+            purpose: ConfirmPurpose::DeleteMessage {
+                message_id: "msg1".into(),
+            },
+        });
+        let effects = app.update(Action::Key(key(KeyCode::Char('y'))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::DeleteMessage {
+                ref message_id,
+                ..
+            } if message_id == "msg1"
+        )));
+    }
+
+    #[test]
+    fn message_deleted_removes_from_list() {
+        let mut app = app_on_main();
+        app.messages = vec![
+            json!({"id": "m1", "content": "first"}),
+            json!({"id": "m2", "content": "second"}),
+        ];
+        app.update(Action::MessageDeleted {
+            message_id: "m1".into(),
+        });
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].get("id").unwrap().as_str().unwrap(), "m2");
+    }
+
+    #[test]
+    fn reply_sets_context_and_focuses_composer() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "evt1",
+            "content": "hello world",
+            "author": "somepub",
+            "display_name": "Alice"
+        })];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('R'))));
+        assert_eq!(app.focus, Panel::Composer);
+        let (event_id, author, preview) = app.reply_to.as_ref().unwrap();
+        assert_eq!(event_id, "evt1");
+        assert_eq!(author, "Alice");
+        assert_eq!(preview, "hello world");
+    }
+
+    #[test]
+    fn send_with_reply_includes_reply_to() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.reply_to = Some(("evt1".into(), "Alice".into(), "hello".into()));
+        app.composer.insert('h');
+        app.composer.insert('i');
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::SendMessage {
+                reply_to: Some(ref id),
+                ..
+            } if id == "evt1"
+        )));
+        assert!(
+            app.reply_to.is_none(),
+            "reply_to should be cleared after send"
+        );
+    }
+
+    #[test]
+    fn send_without_reply_has_none() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.composer.insert('h');
+        app.composer.insert('i');
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendMessage { reply_to: None, .. })));
+    }
+
+    #[test]
+    fn esc_from_composer_clears_reply() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.active_group_id = Some("g1".into());
+        app.reply_to = Some(("evt1".into(), "Alice".into(), "hello".into()));
+        app.update(Action::Key(key(KeyCode::Esc)));
+        assert!(app.reply_to.is_none());
+        assert_eq!(app.focus, Panel::Messages);
+    }
+
+    #[test]
+    fn u_uppercase_opens_file_browser() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        let effects = app.update(Action::Key(key(KeyCode::Char('U'))));
+        assert!(effects.is_empty());
+        match &app.popup {
+            Some(Popup::FileBrowser {
+                path,
+                entries,
+                selected,
+            }) => {
+                assert_eq!(*selected, 0);
+                assert!(path.exists());
+                // entries should be sorted: dirs first
+                let dir_section_ended = entries.iter().position(|(_, is_dir)| !is_dir);
+                if let Some(first_file) = dir_section_ended {
+                    for (_, is_dir) in &entries[..first_file] {
+                        assert!(is_dir);
+                    }
+                }
+            }
+            other => panic!("Expected FileBrowser popup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn u_uppercase_noop_without_active_group() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = None;
+        app.update(Action::Key(key(KeyCode::Char('U'))));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn file_browser_select_file_emits_upload() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp"),
+            entries: vec![("docs".into(), true), ("photo.png".into(), false)],
+            selected: 1, // selecting the file
+        });
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::UploadMedia {
+                ref account,
+                ref group_id,
+                ref file_path,
+            } if account == "acc1" && group_id == "g1" && file_path == "/tmp/photo.png"
+        )));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn file_browser_enter_directory() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp"),
+            entries: vec![("subdir".into(), true), ("file.txt".into(), false)],
+            selected: 0, // selecting the directory
+        });
+        app.update(Action::Key(key(KeyCode::Enter)));
+        match &app.popup {
+            Some(Popup::FileBrowser { path, selected, .. }) => {
+                assert_eq!(path, &std::path::PathBuf::from("/tmp/subdir"));
+                assert_eq!(*selected, 0);
+            }
+            other => panic!(
+                "Expected FileBrowser popup after dir enter, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn file_browser_navigation() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp"),
+            entries: vec![
+                ("a".into(), false),
+                ("b".into(), false),
+                ("c".into(), false),
+            ],
+            selected: 0,
+        });
+        // j moves down
+        app.update(Action::Key(key(KeyCode::Char('j'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 1),
+            _ => panic!("expected FileBrowser"),
+        }
+        // k moves up
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 0),
+            _ => panic!("expected FileBrowser"),
+        }
+        // G jumps to bottom
+        app.update(Action::Key(key(KeyCode::Char('G'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 2),
+            _ => panic!("expected FileBrowser"),
+        }
+        // g jumps to top
+        app.update(Action::Key(key(KeyCode::Char('g'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 0),
+            _ => panic!("expected FileBrowser"),
+        }
+        // Esc closes
+        app.update(Action::Key(key(KeyCode::Esc)));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn file_browser_backspace_goes_to_parent() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp/subdir"),
+            entries: vec![("file.txt".into(), false)],
+            selected: 0,
+        });
+        app.update(Action::Key(key(KeyCode::Backspace)));
+        match &app.popup {
+            Some(Popup::FileBrowser { path, selected, .. }) => {
+                assert_eq!(path, &std::path::PathBuf::from("/tmp"));
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("Expected FileBrowser after backspace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn scan_dir_sorts_dirs_first_and_hides_dotfiles() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join("wn_tui_test_scan_dir");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("banana.txt"), "").unwrap();
+        fs::write(tmp.join("apple.txt"), "").unwrap();
+        fs::create_dir(tmp.join("zebra_dir")).unwrap();
+        fs::create_dir(tmp.join("alpha_dir")).unwrap();
+        fs::write(tmp.join(".hidden"), "").unwrap();
+
+        let entries = App::scan_dir(&tmp);
+        // Hidden files excluded
+        assert!(!entries.iter().any(|(n, _)| n.starts_with('.')));
+        // Dirs come first
+        assert_eq!(entries[0], ("alpha_dir".into(), true));
+        assert_eq!(entries[1], ("zebra_dir".into(), true));
+        // Files after dirs
+        assert_eq!(entries[2], ("apple.txt".into(), false));
+        assert_eq!(entries[3], ("banana.txt".into(), false));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn upload_error_shows_popup() {
+        let mut app = app_on_main();
+        app.update(Action::MediaUploadError("file not found".into()));
+        match &app.popup {
+            Some(Popup::Error { message }) => {
+                assert!(message.contains("file not found"));
+            }
+            other => panic!("Expected Error popup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn upload_success_logs() {
+        let mut app = app_on_main();
+        app.update(Action::MediaUploaded);
+        assert!(app.logs.iter().any(|l| l.contains("uploaded successfully")));
     }
 }

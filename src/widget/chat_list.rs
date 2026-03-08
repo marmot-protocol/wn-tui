@@ -34,23 +34,7 @@ fn last_message(chat: &Value) -> Option<&str> {
 /// since CLI commands expect hex-encoded group IDs.
 pub fn group_id(chat: &Value) -> Option<String> {
     let val = chat.get("mls_group_id").or_else(|| chat.get("group_id"))?;
-    if let Some(s) = val.as_str() {
-        return Some(s.to_string());
-    }
-    // Handle object format: {"value": {"vec": [u8, ...]}}
-    let bytes = val
-        .get("value")
-        .and_then(|v| v.get("vec"))
-        .and_then(|v| v.as_array())?;
-    let hex: String = bytes
-        .iter()
-        .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n)))
-        .collect();
-    if hex.is_empty() {
-        None
-    } else {
-        Some(hex)
-    }
+    crate::util::value_to_hex(val)
 }
 
 /// Renders the chat list sidebar.

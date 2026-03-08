@@ -30,6 +30,40 @@ pub enum Action {
     MessageSent,
     MessageSendError(String),
 
+    // Reactions
+    ReactionSuccess,
+    ReactionError(String),
+    MessagesLoaded(Vec<Value>),
+
+    // Message deletion
+    MessageDeleted {
+        message_id: String,
+    },
+    MessageDeleteError(String),
+
+    // Media upload
+    MediaUploaded,
+    MediaUploadError(String),
+
+    // Media
+    MediaDownloaded {
+        file_hash: String,
+        file_path: String,
+    },
+    MediaDownloadFailed {
+        file_hash: String,
+        error: String,
+    },
+    MediaImageLoaded {
+        file_hash: String,
+        bytes: Vec<u8>,
+    },
+    MediaPopupReady {
+        bytes: Vec<u8>,
+        img_width: u32,
+        img_height: u32,
+    },
+
     // Notifications (streaming)
     NotificationUpdate(Value),
     NotificationStreamEnded,
@@ -46,8 +80,11 @@ pub enum Action {
 
     // Profile
     ProfileLoaded(Value),
+    ProfileImageFetched(Vec<u8>),
     ProfileUpdateSuccess(String),
     ProfileUpdateError(String),
+    NsecExported(String),
+    NsecExportError(String),
 
     // Settings
     SettingsLoaded(Value),
@@ -58,10 +95,20 @@ pub enum Action {
     FollowsLoaded(Vec<Value>),
     FollowSuccess(String),
     FollowError(String),
+    FollowCheckResult {
+        pubkey: String,
+        following: bool,
+    },
 
     // User search
     SearchResult(Value),
     SearchStreamEnded,
+    UserProfileLoaded(Value),
+    UserProfileError(String),
+
+    // Account management
+    LogoutSuccess,
+    LogoutError(String),
 
     // Logs
     Log(String),
@@ -91,6 +138,30 @@ pub enum Effect {
         account: String,
         group_id: String,
         text: String,
+        reply_to: Option<String>,
+    },
+
+    LoadMessages {
+        account: String,
+        group_id: String,
+    },
+
+    // Reactions
+    ReactToMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
+        emoji: String,
+    },
+    UnreactToMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
+    },
+    DeleteMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
     },
 
     // Group management
@@ -108,6 +179,7 @@ pub enum Effect {
     CreateGroup {
         account: String,
         name: String,
+        members: Vec<String>,
     },
     AddMember {
         account: String,
@@ -144,7 +216,17 @@ pub enum Effect {
     UpdateProfile {
         account: String,
         name: Option<String>,
+        display_name: Option<String>,
         about: Option<String>,
+        picture: Option<String>,
+        nip05: Option<String>,
+        lud16: Option<String>,
+    },
+    ExportNsec {
+        account: String,
+    },
+    FetchProfileImage {
+        url: String,
     },
 
     // Settings
@@ -170,6 +252,10 @@ pub enum Effect {
         account: String,
         pubkey: String,
     },
+    CheckFollow {
+        account: String,
+        pubkey: String,
+    },
 
     // User search
     SearchUsers {
@@ -177,6 +263,34 @@ pub enum Effect {
         query: String,
     },
     UnsubscribeSearch,
+    ShowUserProfile {
+        account: String,
+        pubkey: String,
+    },
+
+    // Account management
+    Logout {
+        account: String,
+    },
+
+    // Media
+    DownloadMedia {
+        account: String,
+        group_id: String,
+        file_hash: String,
+    },
+    LoadMediaImage {
+        file_hash: String,
+        file_path: String,
+    },
+    LoadMediaPopup {
+        file_path: String,
+    },
+    UploadMedia {
+        account: String,
+        group_id: String,
+        file_path: String,
+    },
 
     // Daemon logs
     TailDaemonLog,

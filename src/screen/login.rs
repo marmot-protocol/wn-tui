@@ -31,7 +31,7 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(outer, area);
 
     let content_height = match &app.login_mode {
-        LoginMode::AccountSelect { accounts, .. } => (accounts.len() as u16 + 5).min(inner.height),
+        LoginMode::AccountSelect { accounts, .. } => (accounts.len() as u16 + 6).min(inner.height),
         _ => 7,
     };
     let vertical = Layout::vertical([
@@ -174,7 +174,8 @@ fn draw_account_select(
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Length(1)); // Spacer
-    constraints.push(Constraint::Length(1)); // Hints
+    constraints.push(Constraint::Length(1)); // Hints row 1
+    constraints.push(Constraint::Length(1)); // Hints row 2
 
     let rows = Layout::vertical(constraints).split(area);
 
@@ -227,17 +228,28 @@ fn draw_account_select(
         frame.render_widget(line, rows[2 + i]);
     }
 
-    let hint_row = rows.len() - 1;
-    let hint = Paragraph::new(Line::from(vec![
+    let hint_row1 = rows.len() - 2;
+    let hint_row2 = rows.len() - 1;
+    let line1 = Paragraph::new(Line::from(vec![
         Span::styled("[j/k] ", Style::default().fg(Color::Cyan)),
         Span::raw("Navigate  "),
         Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
         Span::raw("Select  "),
+        Span::styled("[c] ", Style::default().fg(Color::Cyan)),
+        Span::raw("New identity  "),
+        Span::styled("[l] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Login nsec"),
+    ]))
+    .centered();
+    frame.render_widget(line1, rows[hint_row1]);
+    let line2 = Paragraph::new(Line::from(vec![
+        Span::styled("[d] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Logout  "),
         Span::styled("[q] ", Style::default().fg(Color::Cyan)),
         Span::raw("Quit"),
     ]))
     .centered();
-    frame.render_widget(hint, rows[hint_row]);
+    frame.render_widget(line2, rows[hint_row2]);
 }
 
 fn draw_loading(msg: &str, frame: &mut Frame, area: Rect) {

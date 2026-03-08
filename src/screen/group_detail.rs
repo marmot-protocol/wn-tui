@@ -235,6 +235,8 @@ fn draw_hints(frame: &mut Frame, area: Rect) {
     let line2 = Line::from(vec![
         Span::styled("  [R] ", Style::default().fg(Color::Cyan)),
         Span::raw("Rename  "),
+        Span::styled("[i] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Info  "),
         Span::styled("[L] ", Style::default().fg(Color::Cyan)),
         Span::raw("Leave  "),
         Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
