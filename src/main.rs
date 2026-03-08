@@ -3,6 +3,7 @@ mod app;
 mod event;
 mod screen;
 mod tui;
+pub mod util;
 mod widget;
 mod wn;
 
@@ -169,6 +170,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::LoadMessages { .. } => "LoadMessages",
         Effect::ReactToMessage { .. } => "ReactToMessage",
         Effect::UnreactToMessage { .. } => "UnreactToMessage",
+        Effect::DeleteMessage { .. } => "DeleteMessage",
         Effect::LoadGroupDetail { .. } => "LoadGroupDetail",
         Effect::LoadGroupMembers { .. } => "LoadGroupMembers",
         Effect::LoadInvites { .. } => "LoadInvites",
@@ -193,6 +195,10 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::UnsubscribeSearch => "UnsubscribeSearch",
         Effect::ShowUserProfile { .. } => "ShowUserProfile",
         Effect::Logout { .. } => "Logout",
+        Effect::DownloadMedia { .. } => "DownloadMedia",
+        Effect::LoadMediaImage { .. } => "LoadMediaImage",
+        Effect::LoadMediaPopup { .. } => "LoadMediaPopup",
+        Effect::UploadMedia { .. } => "UploadMedia",
         Effect::TailDaemonLog => "TailDaemonLog",
     };
     send_log(tx, format!("Effect: {effect_name}"));
@@ -373,16 +379,27 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
             account,
             group_id,
             text,
+            reply_to,
         } => {
             let tx = tx.clone();
             tokio::spawn(async move {
-                let action =
-                    match wn::exec(&["--account", &account, "messages", "send", &group_id, &text])
-                        .await
-                    {
-                        Ok(_) => Action::MessageSent,
-                        Err(e) => Action::MessageSendError(e.to_string()),
-                    };
+                let mut args = vec![
+                    "--account".to_string(),
+                    account,
+                    "messages".to_string(),
+                    "send".to_string(),
+                    group_id,
+                    text,
+                ];
+                if let Some(event_id) = reply_to {
+                    args.push("--reply-to".to_string());
+                    args.push(event_id);
+                }
+                let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let action = match wn::exec(&args_ref).await {
+                    Ok(_) => Action::MessageSent,
+                    Err(e) => Action::MessageSendError(e.to_string()),
+                };
                 let _ = tx.send(Event::Action(action));
             });
         }
@@ -390,19 +407,12 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::LoadMessages { account, group_id } => {
             let tx = tx.clone();
             tokio::spawn(async move {
-                let action = match wn::exec(&[
-                    "--account",
-                    &account,
-                    "messages",
-                    "list",
-                    &group_id,
-                ])
-                .await
-                {
-                    Ok(serde_json::Value::Array(arr)) => Action::MessagesLoaded(arr),
-                    Ok(val) => Action::MessagesLoaded(vec![val]),
-                    Err(e) => Action::Log(format!("Failed to reload messages: {e}")),
-                };
+                let action =
+                    match wn::exec(&["--account", &account, "messages", "list", &group_id]).await {
+                        Ok(serde_json::Value::Array(arr)) => Action::MessagesLoaded(arr),
+                        Ok(val) => Action::MessagesLoaded(vec![val]),
+                        Err(e) => Action::Log(format!("Failed to reload messages: {e}")),
+                    };
                 let _ = tx.send(Event::Action(action));
             });
         }
@@ -452,6 +462,30 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                 {
                     Ok(_) => Action::ReactionSuccess,
                     Err(e) => Action::ReactionError(e.to_string()),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::DeleteMessage {
+            account,
+            group_id,
+            message_id,
+        } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&[
+                    "--account",
+                    &account,
+                    "messages",
+                    "delete",
+                    &group_id,
+                    &message_id,
+                ])
+                .await
+                {
+                    Ok(_) => Action::MessageDeleted { message_id },
+                    Err(e) => Action::MessageDeleteError(e.to_string()),
                 };
                 let _ = tx.send(Event::Action(action));
             });
@@ -774,7 +808,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
             let tx = tx.clone();
             tokio::spawn(async move {
                 let result = tokio::process::Command::new("curl")
-                    .args(["-s", "-L", "--max-time", "10", &url])
+                    .args(["-s", "-L", "--fail", "--max-time", "10", &url])
                     .output()
                     .await;
                 match result {
@@ -935,6 +969,117 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                 let action = match wn::exec(&["logout", &account]).await {
                     Ok(_) => Action::LogoutSuccess,
                     Err(e) => Action::LogoutError(e.to_string()),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::DownloadMedia {
+            account,
+            group_id,
+            file_hash,
+        } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&[
+                    "--account",
+                    &account,
+                    "media",
+                    "download",
+                    &group_id,
+                    &file_hash,
+                ])
+                .await
+                {
+                    Ok(val) => {
+                        let path = val
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| val.as_str());
+                        match path {
+                            Some(p) => Action::MediaDownloaded {
+                                file_hash: file_hash.clone(),
+                                file_path: p.to_string(),
+                            },
+                            None => Action::MediaDownloadFailed {
+                                file_hash,
+                                error: format!("Unexpected response: {val}"),
+                            },
+                        }
+                    }
+                    Err(e) => Action::MediaDownloadFailed {
+                        file_hash,
+                        error: e.to_string(),
+                    },
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::LoadMediaImage {
+            file_hash,
+            file_path,
+        } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match tokio::fs::read(&file_path).await {
+                    Ok(bytes) => {
+                        let _ =
+                            tx.send(Event::Action(Action::MediaImageLoaded { file_hash, bytes }));
+                    }
+                    Err(e) => {
+                        send_log(&tx, format!("Failed to read media file: {e}"));
+                    }
+                }
+            });
+        }
+
+        Effect::LoadMediaPopup { file_path } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match tokio::fs::read(&file_path).await {
+                    Ok(bytes) => {
+                        // Decode to get dimensions, then send bytes for popup
+                        match image::load_from_memory(&bytes) {
+                            Ok(img) => {
+                                let _ = tx.send(Event::Action(Action::MediaPopupReady {
+                                    img_width: img.width(),
+                                    img_height: img.height(),
+                                    bytes,
+                                }));
+                            }
+                            Err(e) => {
+                                send_log(&tx, format!("Popup image decode failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        send_log(&tx, format!("Failed to read media file for popup: {e}"));
+                    }
+                }
+            });
+        }
+
+        Effect::UploadMedia {
+            account,
+            group_id,
+            file_path,
+        } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&[
+                    "--account",
+                    &account,
+                    "media",
+                    "upload",
+                    "--send",
+                    &group_id,
+                    &file_path,
+                ])
+                .await
+                {
+                    Ok(_) => Action::MediaUploaded,
+                    Err(e) => Action::MediaUploadError(e.to_string()),
                 };
                 let _ = tx.send(Event::Action(action));
             });

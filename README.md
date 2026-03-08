@@ -2,9 +2,9 @@
 
 ![wn-tui](https://blossom.primal.net/ac0d58ade515b45cdc9281f86e2467a9df999394aa28e95ea093cadedf868aaa.png)
 
-A terminal user interface for [WhiteNoise](https://github.com/marmot-protocol/whitenoise), a secure group messenger built on MLS and Nostr.
+A terminal user interface for [WhiteNoise](https://github.com/marmot-protocol/whitenoise-rs), a secure group messenger built on MLS and Nostr.
 
-```
+```text
 +-[Chats]--------+-[Coffee Chat]-------------------------------+
 | > Coffee Chat  | [10:31] alice: Hey everyone                 |
 |   Work         | [10:32] bob: What's up?                     |
@@ -26,13 +26,12 @@ wn-tui is a pure presentation layer over the WhiteNoise CLI. It spawns `wn` comm
 
 ### 1. WhiteNoise daemon and CLI
 
-Build from the [`feat/cli`](https://github.com/marmot-protocol/whitenoise/pull/537) branch of whitenoise-rs:
+Build from [whitenoise-rs](https://github.com/marmot-protocol/whitenoise-rs):
 
 ```sh
-git clone https://github.com/marmot-protocol/whitenoise.git
-cd whitenoise
-git checkout feat/cli
-cargo build --release
+git clone https://github.com/marmot-protocol/whitenoise-rs.git
+cd whitenoise-rs
+cargo build --release --bin wn --features cli --bin wnd
 ```
 
 This produces two binaries in `target/release/`:

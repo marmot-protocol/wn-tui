@@ -5,6 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+use ratatui_image::StatefulImage;
 
 use crate::app::{App, LogTab, Panel};
 use crate::widget::chat_list::ChatListWidget;
@@ -12,7 +13,7 @@ use crate::widget::input::InputWidget;
 use crate::widget::message_list::MessageListWidget;
 use crate::widget::status_bar::StatusBarWidget;
 
-pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
+pub fn draw(app: &mut App, frame: &mut Frame, area: Rect) {
     // Vertical: content [+ log panel] + hints + status bar
     let log_height = if app.show_logs {
         (area.height / 3).max(5) // ~1/3 of screen, minimum 5 rows
@@ -67,7 +68,7 @@ fn draw_chat_list(app: &App, frame: &mut Frame, area: Rect) {
 /// Maximum total rows for the composer (including borders).
 const MAX_COMPOSER_HEIGHT: u16 = 8;
 
-fn draw_message_panel(app: &App, frame: &mut Frame, area: Rect) {
+fn draw_message_panel(app: &mut App, frame: &mut Frame, area: Rect) {
     // Calculate dynamic composer height based on content.
     // inner_width = total width minus 2 border columns
     let inner_width = area.width.saturating_sub(2);
@@ -84,7 +85,7 @@ fn draw_message_panel(app: &App, frame: &mut Frame, area: Rect) {
     draw_composer(app, frame, composer_area);
 }
 
-fn draw_messages(app: &App, frame: &mut Frame, area: Rect) {
+fn draw_messages(app: &mut App, frame: &mut Frame, area: Rect) {
     let title = if let Some(ref gid) = app.active_group_id {
         // Try to find the chat name from the selected chat
         let name = app
@@ -135,14 +136,13 @@ fn draw_messages(app: &App, frame: &mut Frame, area: Rect) {
 
     // Show selection highlight when Messages panel is focused
     let selected = if app.focus == Panel::Messages {
-        app.selected_message
-            .or_else(|| {
-                if app.messages.is_empty() {
-                    None
-                } else {
-                    Some(app.messages.len() - 1)
-                }
-            })
+        app.selected_message.or_else(|| {
+            if app.messages.is_empty() {
+                None
+            } else {
+                Some(app.messages.len() - 1)
+            }
+        })
     } else {
         None
     };
@@ -150,8 +150,18 @@ fn draw_messages(app: &App, frame: &mut Frame, area: Rect) {
     let widget = MessageListWidget::new(&app.messages, app.message_scroll)
         .block(block)
         .my_pubkey(app.account.as_deref())
-        .selected(selected);
+        .selected(selected)
+        .media_downloads(&app.media_downloads)
+        .inline_images(&app.inline_images);
+    let image_rects = widget.image_positions(area);
     frame.render_widget(widget, area);
+
+    // Render inline images on top of the reserved blank rows
+    for (hash, rect) in image_rects {
+        if let Some(proto) = app.inline_images.get_mut(&hash) {
+            frame.render_stateful_widget(StatefulImage::default(), rect, proto);
+        }
+    }
 }
 
 fn draw_composer(app: &App, frame: &mut Frame, area: Rect) {
@@ -162,14 +172,21 @@ fn draw_composer(app: &App, frame: &mut Frame, area: Rect) {
         Color::DarkGray
     };
 
-    let placeholder = if app.active_group_id.is_some() {
-        if focused {
-            " Type a message... "
+    let placeholder: String = if let Some((_, ref author, ref preview)) = app.reply_to {
+        let truncated = if preview.chars().count() > 30 {
+            format!("{}...", preview.chars().take(27).collect::<String>())
         } else {
-            " [i] to compose "
+            preview.clone()
+        };
+        format!(" Replying to {author}: \"{truncated}\" ")
+    } else if app.active_group_id.is_some() {
+        if focused {
+            " Type a message... ".to_string()
+        } else {
+            " [i] to compose ".to_string()
         }
     } else {
-        ""
+        String::new()
     };
 
     let block = Block::default()
@@ -221,6 +238,9 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
             key("S"),
             label("Settings"),
             sep(),
+            key("A"),
+            label("Switch account"),
+            sep(),
             key("C"),
             label("New identity"),
             sep(),
@@ -240,8 +260,20 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
             key("r"),
             label("React"),
             sep(),
+            key("R"),
+            label("Reply"),
+            sep(),
             key("u"),
             label("Unreact"),
+            sep(),
+            key("d"),
+            label("Delete"),
+            sep(),
+            key("o"),
+            label("Open image"),
+            sep(),
+            key("U"),
+            label("Upload"),
             sep(),
             key("i"),
             label("Compose"),

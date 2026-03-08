@@ -57,6 +57,15 @@ pub enum Popup {
         pubkey: String,
         selected: usize,
     },
+    ImageViewer {
+        img_width: u32,
+        img_height: u32,
+    },
+    FileBrowser {
+        path: std::path::PathBuf,
+        entries: Vec<(String, bool)>, // (name, is_dir)
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +87,7 @@ pub enum InputPurpose {
 pub enum ConfirmPurpose {
     LeaveGroup,
     RemoveMember { npub: String },
+    DeleteMessage { message_id: String },
     Logout { account: String },
 }
 
@@ -86,6 +96,14 @@ pub enum ConfirmPurpose {
 pub enum SearchPurpose {
     Browse,
     AddMember { group_id: String },
+}
+
+/// State of a media download.
+#[derive(Debug, Clone)]
+pub enum MediaDownload {
+    Downloading,
+    Downloaded(String), // file_path
+    Failed(String),     // error
 }
 
 /// Which log tab is active.
@@ -116,6 +134,8 @@ pub struct App {
     pub selected_message: Option<usize>,
     pub message_viewport_height: usize,
     pub composer: Input,
+    /// Active reply context: (event_id, author_name, content_preview).
+    pub reply_to: Option<(String, String, String)>,
 
     // Notifications
     pub unread_counts: HashMap<String, usize>,
@@ -155,6 +175,10 @@ pub struct App {
     pub search_purpose: SearchPurpose,
     pub follow_checks: HashMap<String, bool>,
 
+    // Media
+    pub media_downloads: HashMap<String, MediaDownload>,
+    pub inline_images: HashMap<String, StatefulProtocol>,
+
     // Log panel
     pub show_logs: bool,
     pub logs: Vec<String>,
@@ -185,6 +209,7 @@ impl App {
             selected_message: None,
             message_viewport_height: 20, // updated each render
             composer: Input::new(),
+            reply_to: None,
             unread_counts: HashMap::new(),
             connected: false,
             viewing_group_id: None,
@@ -206,6 +231,8 @@ impl App {
             selected_result: 0,
             search_purpose: SearchPurpose::Browse,
             follow_checks: HashMap::new(),
+            media_downloads: HashMap::new(),
+            inline_images: HashMap::new(),
             show_logs: false,
             logs: Vec::new(),
             daemon_logs: Vec::new(),
@@ -261,7 +288,7 @@ impl App {
             // Message streaming
             Action::MessageUpdate { group_id, message } => {
                 if self.active_group_id.as_deref() == Some(&group_id) {
-                    self.handle_message_update(message);
+                    return self.handle_message_update(message);
                 }
             }
             Action::MessageStreamEnded => {}
@@ -277,9 +304,7 @@ impl App {
             // Reactions
             Action::ReactionSuccess => {
                 // Reload messages to get updated reaction counts
-                if let (Some(account), Some(group_id)) =
-                    (&self.account, &self.active_group_id)
-                {
+                if let (Some(account), Some(group_id)) = (&self.account, &self.active_group_id) {
                     return vec![Effect::LoadMessages {
                         account: account.clone(),
                         group_id: group_id.clone(),
@@ -288,10 +313,116 @@ impl App {
             }
             Action::MessagesLoaded(msgs) => {
                 self.messages = msgs;
+                let mut effects = Vec::new();
+                for msg in &self.messages {
+                    for (hash, _, _) in Self::image_attachments(msg) {
+                        if !self.media_downloads.contains_key(&hash) {
+                            if let (Some(account), Some(group_id)) =
+                                (&self.account, &self.active_group_id)
+                            {
+                                self.media_downloads
+                                    .insert(hash.clone(), MediaDownload::Downloading);
+                                effects.push(Effect::DownloadMedia {
+                                    account: account.clone(),
+                                    group_id: group_id.clone(),
+                                    file_hash: hash,
+                                });
+                            }
+                        }
+                    }
+                }
+                if !effects.is_empty() {
+                    return effects;
+                }
             }
             Action::ReactionError(msg) => {
                 self.popup = Some(Popup::Error {
                     message: format!("Reaction failed: {msg}"),
+                });
+            }
+
+            // Message deletion
+            Action::MessageDeleted { message_id } => {
+                self.messages
+                    .retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(&message_id));
+            }
+            Action::MessageDeleteError(msg) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Delete failed: {msg}"),
+                });
+            }
+
+            // Media
+            Action::MediaDownloaded {
+                file_hash,
+                file_path,
+            } => {
+                self.media_downloads.insert(
+                    file_hash.clone(),
+                    MediaDownload::Downloaded(file_path.clone()),
+                );
+                // Auto-load image for inline display
+                return vec![Effect::LoadMediaImage {
+                    file_hash,
+                    file_path,
+                }];
+            }
+            Action::MediaDownloadFailed { file_hash, error } => {
+                self.logs.push(format!("Media download failed: {error}"));
+                self.media_downloads
+                    .insert(file_hash, MediaDownload::Failed(error));
+            }
+            Action::MediaImageLoaded { file_hash, bytes } => {
+                if let Some(picker) = &self.picker {
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            self.logs.push(format!(
+                                "Inline image ready: {} ({}x{}, {} bytes)",
+                                &file_hash[..file_hash.len().min(16)],
+                                img.width(),
+                                img.height(),
+                                bytes.len()
+                            ));
+                            let proto = picker.new_resize_protocol(img);
+                            self.inline_images.insert(file_hash, proto);
+                        }
+                        Err(e) => {
+                            self.logs
+                                .push(format!("Image decode failed for {file_hash}: {e}"));
+                        }
+                    }
+                }
+            }
+
+            Action::MediaPopupReady {
+                bytes,
+                img_width,
+                img_height,
+            } => {
+                if let Some(picker) = &self.picker {
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let proto = picker.new_resize_protocol(img);
+                            self.popup_image = Some(proto);
+                            self.popup = Some(Popup::ImageViewer {
+                                img_width,
+                                img_height,
+                            });
+                        }
+                        Err(e) => {
+                            self.logs.push(format!("Popup image decode failed: {e}"));
+                        }
+                    }
+                }
+            }
+
+            Action::MediaUploaded => {
+                self.logs.push("Media uploaded successfully".to_string());
+            }
+            Action::MediaUploadError(e) => {
+                self.logs.push(format!("Media upload failed: {e}"));
+                self.popup = Some(Popup::Error {
+                    message: format!("Upload failed: {e}"),
                 });
             }
 
@@ -580,7 +711,7 @@ impl App {
         ]
     }
 
-    /// Build an `UpdateProfile` effect, applying a single field via the closure.
+    /// Build an `UpdateProfile` effect from the given field values.
     fn profile_update(
         account: String,
         name: Option<String>,
@@ -601,7 +732,9 @@ impl App {
         }
     }
 
-    fn handle_logout(&mut self) -> Vec<Effect> {
+    /// Reset all account-specific UI state and navigate to the account selector.
+    /// Does NOT call `wn logout` — just clears in-memory state and re-checks accounts.
+    fn reset_to_account_select(&mut self) -> Vec<Effect> {
         self.screen = Screen::Login;
         self.login_mode = LoginMode::Loading("Checking accounts...".into());
         self.account = None;
@@ -620,7 +753,14 @@ impl App {
         self.group_detail = None;
         self.group_members.clear();
         self.group_admins.clear();
+        self.media_downloads.clear();
+        self.inline_images.clear();
+        self.reply_to = None;
         vec![Effect::CheckAccounts]
+    }
+
+    fn handle_logout(&mut self) -> Vec<Effect> {
+        self.reset_to_account_select()
     }
 
     /// Total unread messages across all chats.
@@ -706,11 +846,86 @@ impl App {
         }
     }
 
-    fn handle_message_update(&mut self, val: Value) {
+    /// Extract image attachments from a message: (file_hash_hex, mime_type, filename).
+    ///
+    /// CLI attachment fields (verified 2026-03-07):
+    ///   `original_file_hash` — hex string or byte vec
+    ///   `mime_type` — e.g. "image/jpeg"
+    ///   `file_metadata` — may contain filename
+    ///   `blossom_url` — fallback for filename extraction
+    pub fn image_attachments(msg: &Value) -> Vec<(String, String, String)> {
+        let attachments = match msg.get("media_attachments").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => return vec![],
+        };
+        let mut result = Vec::new();
+        for att in attachments {
+            let mime = att.get("mime_type").and_then(|v| v.as_str()).unwrap_or("");
+            if !mime.starts_with("image/") {
+                continue;
+            }
+            // Extract filename: try file_metadata.original_filename, then filename, then blossom_url basename
+            let filename = att
+                .get("file_metadata")
+                .and_then(|m| m.get("original_filename").or_else(|| m.get("filename")))
+                .and_then(|v| v.as_str())
+                .or_else(|| att.get("filename").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    att.get("blossom_url")
+                        .and_then(|v| v.as_str())
+                        .and_then(|url| url.rsplit('/').next())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "image".to_string());
+            // Hash: try original_file_hash first, then file_hash, then encrypted_file_hash
+            let hash_hex = crate::util::extract_hash_hex(att, "original_file_hash")
+                .or_else(|| crate::util::extract_hash_hex(att, "file_hash"))
+                .or_else(|| crate::util::extract_hash_hex(att, "encrypted_file_hash"));
+            let hash_hex = match hash_hex {
+                Some(h) if !h.is_empty() => h,
+                _ => continue,
+            };
+            result.push((hash_hex, mime.to_string(), filename));
+        }
+        result
+    }
+
+    /// Emit download effects for image attachments not already tracked.
+    fn download_effects_for_message(&mut self, msg: &Value) -> Vec<Effect> {
+        let (account, group_id) = match (&self.account, &self.active_group_id) {
+            (Some(a), Some(g)) => (a.clone(), g.clone()),
+            _ => return vec![],
+        };
+        let attachments = Self::image_attachments(msg);
+        if !attachments.is_empty() {
+            self.logs.push(format!(
+                "Auto-download: found {} image attachment(s)",
+                attachments.len()
+            ));
+        }
+        let mut effects = Vec::new();
+        for (hash, _, filename) in attachments {
+            if !self.media_downloads.contains_key(&hash) {
+                self.logs
+                    .push(format!("Auto-download: queuing {filename} (hash={hash})"));
+                self.media_downloads
+                    .insert(hash.clone(), MediaDownload::Downloading);
+                effects.push(Effect::DownloadMedia {
+                    account: account.clone(),
+                    group_id: group_id.clone(),
+                    file_hash: hash,
+                });
+            }
+        }
+        effects
+    }
+
+    fn handle_message_update(&mut self, val: Value) -> Vec<Effect> {
         // Only display chat messages (kind 9), skip reactions (7), deletions (5), etc.
         if let Some(kind) = val.get("kind").and_then(|v| v.as_u64()) {
             if kind != 9 {
-                return;
+                return vec![];
             }
         }
 
@@ -721,14 +936,16 @@ impl App {
                 .iter()
                 .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(id))
             {
-                return;
+                return vec![];
             }
         }
+        let effects = self.download_effects_for_message(&val);
         let was_at_bottom = self.message_scroll == 0;
         self.messages.push(val);
         if !was_at_bottom {
             self.message_scroll += 1;
         }
+        effects
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -897,17 +1114,107 @@ impl App {
                 }
                 _ => vec![],
             },
+            Popup::FileBrowser {
+                path,
+                entries,
+                selected,
+            } => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !entries.is_empty() {
+                        *selected = (*selected + 1).min(entries.len() - 1);
+                    }
+                    vec![]
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    vec![]
+                }
+                KeyCode::Char('g') => {
+                    *selected = 0;
+                    vec![]
+                }
+                KeyCode::Char('G') => {
+                    if !entries.is_empty() {
+                        *selected = entries.len() - 1;
+                    }
+                    vec![]
+                }
+                KeyCode::Char('~') => {
+                    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+                    *entries = Self::scan_dir(&home);
+                    *path = home;
+                    *selected = 0;
+                    vec![]
+                }
+                KeyCode::Enter => {
+                    if let Some((name, is_dir)) = entries.get(*selected).cloned() {
+                        if is_dir {
+                            let new_path = path.join(&name);
+                            *entries = Self::scan_dir(&new_path);
+                            *path = new_path;
+                            *selected = 0;
+                        } else {
+                            let file_path = path.join(&name).to_string_lossy().to_string();
+                            self.popup = None;
+                            if let (Some(account), Some(group_id)) =
+                                (&self.account, &self.active_group_id)
+                            {
+                                return vec![Effect::UploadMedia {
+                                    account: account.clone(),
+                                    group_id: group_id.clone(),
+                                    file_path,
+                                }];
+                            }
+                        }
+                    }
+                    vec![]
+                }
+                KeyCode::Backspace | KeyCode::Char('h') => {
+                    if let Some(parent) = path.parent().map(|p| p.to_path_buf()) {
+                        *entries = Self::scan_dir(&parent);
+                        *path = parent;
+                        *selected = 0;
+                    }
+                    vec![]
+                }
+                KeyCode::Esc => {
+                    self.popup = None;
+                    vec![]
+                }
+                _ => vec![],
+            },
             Popup::Help { .. }
             | Popup::Error { .. }
             | Popup::Info { .. }
             | Popup::UserProfile { .. }
-            | Popup::GroupInfo { .. } => {
-                // Any key dismisses help/error/info/profile/group info popups
+            | Popup::GroupInfo { .. }
+            | Popup::ImageViewer { .. } => {
+                // Any key dismisses help/error/info/profile/group info/image viewer popups
                 self.popup_image = None;
                 self.popup = None;
                 vec![]
             }
         }
+    }
+
+    fn scan_dir(path: &std::path::Path) -> Vec<(String, bool)> {
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(path) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                entries.push((name, is_dir));
+            }
+        }
+        entries.sort_by(|a, b| match (a.1, b.1) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+        });
+        entries
     }
 
     fn submit_text_input(&mut self, purpose: InputPurpose, value: String) -> Vec<Effect> {
@@ -1038,16 +1345,30 @@ impl App {
             None => return vec![],
         };
 
-        let group_id = match &self.viewing_group_id {
-            Some(g) => g.clone(),
-            None => return vec![],
-        };
-
         match purpose {
+            ConfirmPurpose::DeleteMessage { message_id } => {
+                let group_id = match &self.active_group_id {
+                    Some(g) => g.clone(),
+                    None => return vec![],
+                };
+                vec![Effect::DeleteMessage {
+                    account,
+                    group_id,
+                    message_id,
+                }]
+            }
             ConfirmPurpose::LeaveGroup => {
+                let group_id = match &self.viewing_group_id {
+                    Some(g) => g.clone(),
+                    None => return vec![],
+                };
                 vec![Effect::LeaveGroup { account, group_id }]
             }
             ConfirmPurpose::RemoveMember { npub } => {
+                let group_id = match &self.viewing_group_id {
+                    Some(g) => g.clone(),
+                    None => return vec![],
+                };
                 vec![Effect::RemoveMember {
                     account,
                     group_id,
@@ -1196,6 +1517,11 @@ impl App {
                 self.screen = Screen::Login;
                 vec![Effect::CreateIdentity]
             }
+            KeyCode::Char('A') => {
+                // Switch account — reset UI state and go to account selector
+                // (does NOT call wn logout — just navigates to the picker)
+                self.reset_to_account_select()
+            }
             KeyCode::Char('q') => {
                 self.running = false;
                 vec![]
@@ -1311,6 +1637,36 @@ impl App {
         }]
     }
 
+    fn delete_selected_message(&mut self) -> Vec<Effect> {
+        let msg_idx = match self.selected_msg_index() {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let msg = &self.messages[msg_idx];
+        // Only allow deleting own messages
+        let author = msg.get("author").and_then(|v| v.as_str()).unwrap_or("");
+        if self.account.as_deref() != Some(author) {
+            return vec![];
+        }
+        let message_id = match msg.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return vec![],
+        };
+        let preview = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect::<String>();
+        self.popup = Some(Popup::Confirm {
+            title: "Delete Message".into(),
+            message: format!("Delete \"{preview}\"?"),
+            purpose: ConfirmPurpose::DeleteMessage { message_id },
+        });
+        vec![]
+    }
+
     fn handle_messages_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match key.code {
             KeyCode::Char('k') | KeyCode::Up => {
@@ -1359,7 +1715,64 @@ impl App {
                 });
                 vec![]
             }
+            KeyCode::Char('o') => {
+                // Open first downloaded image attachment in full-size popup
+                if let Some(idx) = self.selected_msg_index() {
+                    if let Some(msg) = self.messages.get(idx) {
+                        for (hash, _, _) in Self::image_attachments(msg) {
+                            if let Some(MediaDownload::Downloaded(path)) =
+                                self.media_downloads.get(&hash)
+                            {
+                                return vec![Effect::LoadMediaPopup {
+                                    file_path: path.clone(),
+                                }];
+                            }
+                        }
+                    }
+                }
+                vec![]
+            }
             KeyCode::Char('u') => self.unreact_to_selected(),
+            KeyCode::Char('d') => self.delete_selected_message(),
+            KeyCode::Char('U') => {
+                if self.active_group_id.is_some() {
+                    let start = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+                    let entries = Self::scan_dir(&start);
+                    self.popup = Some(Popup::FileBrowser {
+                        path: start,
+                        entries,
+                        selected: 0,
+                    });
+                }
+                vec![]
+            }
+            KeyCode::Char('R') => {
+                // Reply to selected message
+                if let Some(idx) = self.selected_msg_index() {
+                    if let Some(msg) = self.messages.get(idx) {
+                        let event_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if event_id.is_empty() {
+                            return vec![];
+                        }
+                        let author = msg
+                            .get("display_name")
+                            .or_else(|| msg.get("author_name"))
+                            .or_else(|| msg.get("author"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let preview: String = msg
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .chars()
+                            .take(30)
+                            .collect();
+                        self.reply_to = Some((event_id.to_string(), author.to_string(), preview));
+                        self.focus = Panel::Composer;
+                    }
+                }
+                vec![]
+            }
             KeyCode::Char('i') | KeyCode::Enter => {
                 self.focus = Panel::Composer;
                 vec![]
@@ -1383,18 +1796,22 @@ impl App {
                     if let (Some(account), Some(group_id)) = (&self.account, &self.active_group_id)
                     {
                         let text = self.composer.value.clone();
+                        let reply_to = self.reply_to.as_ref().map(|(id, _, _)| id.clone());
                         let effect = Effect::SendMessage {
                             account: account.clone(),
                             group_id: group_id.clone(),
                             text,
+                            reply_to,
                         };
                         self.composer.clear();
+                        self.reply_to = None;
                         return vec![effect];
                     }
                 }
                 vec![]
             }
             KeyCode::Esc => {
+                self.reply_to = None;
                 self.focus = Panel::Messages;
                 vec![]
             }
@@ -1453,6 +1870,9 @@ impl App {
 
         self.active_group_id = Some(group_id.clone());
         self.messages.clear();
+        self.media_downloads.clear();
+        self.inline_images.clear();
+        self.reply_to = None;
         self.message_scroll = 0;
         self.selected_message = None;
         self.focus = Panel::Messages;
@@ -2269,46 +2689,16 @@ impl App {
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "?".into());
 
-                // Convert byte vec fields to hex string.
-                // Handles: {"value":{"vec":[u8,...]}}, direct [u8,...], or string.
-                let bytes_to_hex = |val: &Value| -> String {
-                    if val.is_null() {
-                        return "(unavailable)".into();
-                    }
-                    if let Some(s) = val.as_str() {
-                        if s.is_empty() {
-                            return "(unavailable)".into();
-                        }
-                        return s.to_string();
-                    }
-                    // Try nested {"value":{"vec":[...]}} first, then direct array
-                    let arr = val
-                        .get("value")
-                        .and_then(|v| v.get("vec"))
-                        .and_then(|v| v.as_array())
-                        .or_else(|| val.as_array());
-                    match arr {
-                        Some(a) if !a.is_empty() => {
-                            let hex: String = a
-                                .iter()
-                                .filter_map(|b| b.as_u64().map(|n| format!("{:02x}", n)))
-                                .collect();
-                            if hex.is_empty() {
-                                "(unavailable)".into()
-                            } else {
-                                hex
-                            }
-                        }
-                        _ => "(unavailable)".into(),
-                    }
+                let to_hex_display = |val: &Value| -> String {
+                    crate::util::value_to_hex(val).unwrap_or_else(|| "(unavailable)".into())
                 };
                 let mls_id = data
                     .get("mls_group_id")
-                    .map(bytes_to_hex)
+                    .map(to_hex_display)
                     .unwrap_or_else(|| "(unavailable)".into());
                 let nostr_id = data
                     .get("nostr_group_id")
-                    .map(bytes_to_hex)
+                    .map(to_hex_display)
                     .unwrap_or_else(|| "(unavailable)".into());
 
                 let admin_count = data
@@ -2442,6 +2832,143 @@ impl App {
                     .size(50, height);
                 frame.render_widget(widget, area);
             }
+            Popup::ImageViewer {
+                img_width,
+                img_height,
+            } => {
+                use crate::widget::popup::centered_rect;
+                use ratatui::layout::Rect;
+                use ratatui::widgets::{Block, Paragraph};
+                use ratatui_image::StatefulImage;
+
+                // Size popup to image aspect ratio.
+                // Terminal cells are ~2:1 (twice as tall as wide), so divide
+                // pixel height by 2 when converting to cell rows.
+                let max_w = area.width.saturating_sub(4);
+                let max_h = area.height.saturating_sub(4);
+                let aspect = *img_width as f64 / (*img_height).max(1) as f64;
+
+                // Start with max width, compute height from aspect ratio
+                // cell_height = pixel_height / 2 relative to width
+                let mut w = max_w;
+                let mut h = (w as f64 / aspect / 2.0).ceil() as u16;
+
+                // If height exceeds max, scale down from height instead
+                if h > max_h {
+                    h = max_h;
+                    w = (h as f64 * aspect * 2.0).ceil() as u16;
+                }
+
+                // Add 2 for borders + 1 for hint line
+                let popup_w = (w + 2).min(area.width);
+                let popup_h = (h + 3).min(area.height);
+                let popup_area = centered_rect(popup_w, popup_h, area);
+
+                let block = Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Image Viewer ");
+                let inner = block.inner(popup_area);
+
+                // Clear background
+                frame.render_widget(ratatui::widgets::Clear, popup_area);
+                frame.render_widget(block, popup_area);
+
+                if let Some(proto) = &mut self.popup_image {
+                    if inner.width > 0 && inner.height > 1 {
+                        let img_area = Rect::new(
+                            inner.x,
+                            inner.y,
+                            inner.width,
+                            inner.height.saturating_sub(1),
+                        );
+                        frame.render_stateful_widget(StatefulImage::default(), img_area, proto);
+                    }
+                }
+
+                // Hint at bottom
+                let hint_area = Rect::new(
+                    inner.x,
+                    inner.y + inner.height.saturating_sub(1),
+                    inner.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            " Any key ",
+                            Style::default().fg(Color::Black).bg(Color::DarkGray),
+                        ),
+                        Span::styled(" Close", Style::default().fg(Color::DarkGray)),
+                    ])),
+                    hint_area,
+                );
+            }
+            Popup::FileBrowser {
+                path,
+                entries,
+                selected,
+            } => {
+                let title = {
+                    let p = path.display().to_string();
+                    if p.len() > 56 {
+                        format!("...{}", &p[p.len() - 53..])
+                    } else {
+                        p
+                    }
+                };
+                let body: Vec<Line> = if entries.is_empty() {
+                    vec![Line::styled(
+                        "  (empty directory)",
+                        Style::default().fg(Color::DarkGray),
+                    )]
+                } else {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, is_dir))| {
+                            let marker = if i == *selected { ">" } else { " " };
+                            let display = if *is_dir {
+                                format!("{name}/")
+                            } else {
+                                name.clone()
+                            };
+                            let style = if i == *selected {
+                                if *is_dir {
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(ratatui::style::Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::Cyan)
+                                }
+                            } else if *is_dir {
+                                Style::default().fg(Color::Blue)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+                            Line::from(vec![
+                                Span::styled(
+                                    format!("  {marker} "),
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(display, style),
+                            ])
+                        })
+                        .collect()
+                };
+                let height = (body.len() as u16 + 5).min(20);
+                let widget = PopupWidget::new(&title)
+                    .body(body)
+                    .hints(vec![
+                        ("Enter", "Open"),
+                        ("j/k", "Navigate"),
+                        ("Bksp", "Parent"),
+                        ("~", "Home"),
+                        ("Esc", "Cancel"),
+                    ])
+                    .size(60, height);
+                frame.render_widget(widget, area);
+            }
         }
     }
 }
@@ -2520,10 +3047,16 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
         }
         Screen::Profile => {
             lines.push(hint("n", "Edit name"));
+            lines.push(hint("D", "Edit display name"));
             lines.push(hint("a", "Edit about"));
+            lines.push(hint("P", "Edit picture URL"));
+            lines.push(hint("5", "Edit NIP-05"));
+            lines.push(hint("$", "Edit lightning address"));
+            lines.push(hint("e", "Show nsec"));
             lines.push(hint("j / k", "Navigate follows"));
             lines.push(hint("Enter", "View profile"));
             lines.push(hint("d", "Unfollow"));
+            lines.push(hint("Q", "Logout"));
             lines.push(hint("Esc", "Back"));
         }
         Screen::Settings => {
@@ -2836,10 +3369,16 @@ mod tests {
     fn message_update_skips_reaction_and_deletion_events() {
         let mut app = app_on_main();
         app.active_group_id = Some("g1".into());
-        app.update(msg_update(json!({"id": "msg1", "content": "hello", "kind": 9})));
+        app.update(msg_update(
+            json!({"id": "msg1", "content": "hello", "kind": 9}),
+        ));
         app.update(msg_update(json!({"id": "r1", "content": "+", "kind": 7})));
         app.update(msg_update(json!({"id": "d1", "content": "", "kind": 5})));
-        assert_eq!(app.messages.len(), 1, "Only kind-9 chat messages should be kept");
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "Only kind-9 chat messages should be kept"
+        );
     }
 
     // ── Notifications ────────────────────────────────────────────────
@@ -3738,9 +4277,7 @@ mod tests {
         let mut app = app_on_main();
         app.focus = Panel::Messages;
         app.active_group_id = Some("g1".into());
-        app.messages = vec![
-            json!({"id": "msg1", "content": "hello", "author": "a"}),
-        ];
+        app.messages = vec![json!({"id": "msg1", "content": "hello", "author": "a"})];
         app.selected_message = Some(0);
         // Open popup and submit
         app.update(Action::Key(key(KeyCode::Char('r'))));
@@ -4025,5 +4562,590 @@ mod tests {
         app.focus = Panel::ChatList;
         app.update(Action::Paste("should be ignored".into()));
         assert!(app.composer.is_empty());
+    }
+
+    // ── Media / image_attachments tests ─────────────────────────────
+
+    #[test]
+    fn image_attachments_extracts_image_hashes() {
+        let msg = json!({
+            "content": "check this",
+            "media_attachments": [
+                {
+                    "file_hash": "abc123",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "abc123");
+        assert_eq!(result[0].1, "image/png");
+        assert_eq!(result[0].2, "photo.png");
+    }
+
+    #[test]
+    fn image_attachments_skips_non_images() {
+        let msg = json!({
+            "content": "file here",
+            "media_attachments": [
+                {
+                    "file_hash": "abc123",
+                    "mime_type": "application/pdf",
+                    "filename": "doc.pdf"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn image_attachments_handles_byte_vec_hash() {
+        let msg = json!({
+            "content": "img",
+            "media_attachments": [
+                {
+                    "file_hash": {"value": {"vec": [0xab, 0xcd, 0xef]}},
+                    "mime_type": "image/jpeg",
+                    "filename": "img.jpg"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "abcdef");
+    }
+
+    #[test]
+    fn image_attachments_real_cli_format() {
+        // Matches actual `wn messages list --json` output (verified 2026-03-07)
+        let msg = json!({
+            "content": "",
+            "kind": 9,
+            "media_attachments": [
+                {
+                    "account_pubkey": "abc123",
+                    "blossom_url": "https://blossom.primal.net/d012c620",
+                    "mime_type": "image/jpeg",
+                    "original_file_hash": [234, 240, 211, 181],
+                    "encrypted_file_hash": [208, 18, 198, 32],
+                    "file_metadata": {
+                        "original_filename": "signal-2026-03-03.jpeg"
+                    },
+                    "file_path": "",
+                    "media_type": "chat_media"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 1, "Should find 1 image attachment");
+        assert_eq!(result[0].0, "eaf0d3b5", "Hash should be hex of byte array");
+        assert_eq!(result[0].1, "image/jpeg");
+        assert_eq!(
+            result[0].2, "signal-2026-03-03.jpeg",
+            "Should use original_filename"
+        );
+    }
+
+    #[test]
+    fn image_attachments_empty_when_no_attachments() {
+        let msg = json!({"content": "hello"});
+        assert!(App::image_attachments(&msg).is_empty());
+    }
+
+    #[test]
+    fn image_attachments_mixed_types() {
+        let msg = json!({
+            "content": "mixed",
+            "media_attachments": [
+                {
+                    "file_hash": "hash1",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                },
+                {
+                    "file_hash": "hash2",
+                    "mime_type": "application/zip",
+                    "filename": "archive.zip"
+                },
+                {
+                    "file_hash": "hash3",
+                    "mime_type": "image/gif",
+                    "filename": "anim.gif"
+                }
+            ]
+        });
+        let result = App::image_attachments(&msg);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "hash1");
+        assert_eq!(result[1].0, "hash3");
+    }
+
+    #[test]
+    fn media_downloaded_updates_state() {
+        let mut app = app_on_main();
+        app.media_downloads
+            .insert("hash1".into(), MediaDownload::Downloading);
+        app.update(Action::MediaDownloaded {
+            file_hash: "hash1".into(),
+            file_path: "/tmp/img.png".into(),
+        });
+        assert!(matches!(
+            app.media_downloads.get("hash1"),
+            Some(MediaDownload::Downloaded(p)) if p == "/tmp/img.png"
+        ));
+    }
+
+    #[test]
+    fn media_download_failed_updates_state() {
+        let mut app = app_on_main();
+        app.media_downloads
+            .insert("hash1".into(), MediaDownload::Downloading);
+        app.update(Action::MediaDownloadFailed {
+            file_hash: "hash1".into(),
+            error: "not found".into(),
+        });
+        assert!(matches!(
+            app.media_downloads.get("hash1"),
+            Some(MediaDownload::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn select_chat_clears_media_downloads() {
+        let mut app = app_on_main();
+        app.chats = vec![json!({"name": "test", "mls_group_id": "aabb"})];
+        app.media_downloads
+            .insert("hash1".into(), MediaDownload::Downloading);
+        app.selected_chat = 0;
+        app.active_group_id = Some("other".into());
+        app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(app.media_downloads.is_empty());
+    }
+
+    #[test]
+    fn message_update_triggers_download_for_image() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        let msg = json!({
+            "id": "m1",
+            "kind": 9,
+            "content": "look",
+            "author": "a",
+            "media_attachments": [
+                {
+                    "file_hash": "imghash",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                }
+            ]
+        });
+        let effects = app.update(Action::MessageUpdate {
+            group_id: "g1".into(),
+            message: msg,
+        });
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::DownloadMedia { ref file_hash, .. } if file_hash == "imghash")
+        ));
+        assert!(matches!(
+            app.media_downloads.get("imghash"),
+            Some(MediaDownload::Downloading)
+        ));
+    }
+
+    #[test]
+    fn o_opens_image_when_downloaded() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "m1",
+            "content": "img",
+            "author": "a",
+            "media_attachments": [
+                {
+                    "file_hash": "imghash",
+                    "mime_type": "image/png",
+                    "filename": "photo.png"
+                }
+            ]
+        })];
+        app.selected_message = Some(0);
+        app.media_downloads.insert(
+            "imghash".into(),
+            MediaDownload::Downloaded("/tmp/photo.png".into()),
+        );
+        let effects = app.update(Action::Key(key(KeyCode::Char('o'))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::LoadMediaPopup {
+                ref file_path,
+                ..
+            } if file_path == "/tmp/photo.png"
+        )));
+    }
+
+    #[test]
+    fn o_noop_when_no_image_downloaded() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "m1",
+            "content": "text only",
+            "author": "a"
+        })];
+        app.selected_message = Some(0);
+        let effects = app.update(Action::Key(key(KeyCode::Char('o'))));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn switch_account_resets_state_and_checks_accounts() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.chats = vec![json!({"name": "test"})];
+        app.messages = vec![json!({"content": "hi"})];
+        app.focus = Panel::ChatList;
+        let effects = app.update(Action::Key(key(KeyCode::Char('A'))));
+        assert_eq!(app.screen, Screen::Login);
+        assert!(app.account.is_none());
+        assert!(app.chats.is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.active_group_id.is_none());
+        assert!(effects.iter().any(|e| matches!(e, Effect::CheckAccounts)));
+    }
+
+    #[test]
+    fn d_opens_confirm_for_own_message() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("mypub".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "msg1",
+            "content": "my message",
+            "author": "mypub"
+        })];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('d'))));
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Confirm {
+                purpose: ConfirmPurpose::DeleteMessage { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn d_noop_for_others_message() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("mypub".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "msg1",
+            "content": "their message",
+            "author": "otherpub"
+        })];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('d'))));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn confirm_delete_emits_effect() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::Confirm {
+            title: "Delete".into(),
+            message: "Delete?".into(),
+            purpose: ConfirmPurpose::DeleteMessage {
+                message_id: "msg1".into(),
+            },
+        });
+        let effects = app.update(Action::Key(key(KeyCode::Char('y'))));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::DeleteMessage {
+                ref message_id,
+                ..
+            } if message_id == "msg1"
+        )));
+    }
+
+    #[test]
+    fn message_deleted_removes_from_list() {
+        let mut app = app_on_main();
+        app.messages = vec![
+            json!({"id": "m1", "content": "first"}),
+            json!({"id": "m2", "content": "second"}),
+        ];
+        app.update(Action::MessageDeleted {
+            message_id: "m1".into(),
+        });
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].get("id").unwrap().as_str().unwrap(), "m2");
+    }
+
+    #[test]
+    fn reply_sets_context_and_focuses_composer() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.messages = vec![json!({
+            "id": "evt1",
+            "content": "hello world",
+            "author": "somepub",
+            "display_name": "Alice"
+        })];
+        app.selected_message = Some(0);
+        app.update(Action::Key(key(KeyCode::Char('R'))));
+        assert_eq!(app.focus, Panel::Composer);
+        let (event_id, author, preview) = app.reply_to.as_ref().unwrap();
+        assert_eq!(event_id, "evt1");
+        assert_eq!(author, "Alice");
+        assert_eq!(preview, "hello world");
+    }
+
+    #[test]
+    fn send_with_reply_includes_reply_to() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.reply_to = Some(("evt1".into(), "Alice".into(), "hello".into()));
+        app.composer.insert('h');
+        app.composer.insert('i');
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::SendMessage {
+                reply_to: Some(ref id),
+                ..
+            } if id == "evt1"
+        )));
+        assert!(
+            app.reply_to.is_none(),
+            "reply_to should be cleared after send"
+        );
+    }
+
+    #[test]
+    fn send_without_reply_has_none() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.composer.insert('h');
+        app.composer.insert('i');
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendMessage { reply_to: None, .. })));
+    }
+
+    #[test]
+    fn esc_from_composer_clears_reply() {
+        let mut app = app_on_main();
+        app.focus = Panel::Composer;
+        app.active_group_id = Some("g1".into());
+        app.reply_to = Some(("evt1".into(), "Alice".into(), "hello".into()));
+        app.update(Action::Key(key(KeyCode::Esc)));
+        assert!(app.reply_to.is_none());
+        assert_eq!(app.focus, Panel::Messages);
+    }
+
+    #[test]
+    fn u_uppercase_opens_file_browser() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = Some("g1".into());
+        let effects = app.update(Action::Key(key(KeyCode::Char('U'))));
+        assert!(effects.is_empty());
+        match &app.popup {
+            Some(Popup::FileBrowser {
+                path,
+                entries,
+                selected,
+            }) => {
+                assert_eq!(*selected, 0);
+                assert!(path.exists());
+                // entries should be sorted: dirs first
+                let dir_section_ended = entries.iter().position(|(_, is_dir)| !is_dir);
+                if let Some(first_file) = dir_section_ended {
+                    for (_, is_dir) in &entries[..first_file] {
+                        assert!(is_dir);
+                    }
+                }
+            }
+            other => panic!("Expected FileBrowser popup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn u_uppercase_noop_without_active_group() {
+        let mut app = app_on_main();
+        app.focus = Panel::Messages;
+        app.active_group_id = None;
+        app.update(Action::Key(key(KeyCode::Char('U'))));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn file_browser_select_file_emits_upload() {
+        let mut app = app_on_main();
+        app.account = Some("acc1".into());
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp"),
+            entries: vec![("docs".into(), true), ("photo.png".into(), false)],
+            selected: 1, // selecting the file
+        });
+        let effects = app.update(Action::Key(key(KeyCode::Enter)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::UploadMedia {
+                ref account,
+                ref group_id,
+                ref file_path,
+            } if account == "acc1" && group_id == "g1" && file_path == "/tmp/photo.png"
+        )));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn file_browser_enter_directory() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp"),
+            entries: vec![("subdir".into(), true), ("file.txt".into(), false)],
+            selected: 0, // selecting the directory
+        });
+        app.update(Action::Key(key(KeyCode::Enter)));
+        match &app.popup {
+            Some(Popup::FileBrowser { path, selected, .. }) => {
+                assert_eq!(path, &std::path::PathBuf::from("/tmp/subdir"));
+                assert_eq!(*selected, 0);
+            }
+            other => panic!(
+                "Expected FileBrowser popup after dir enter, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn file_browser_navigation() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp"),
+            entries: vec![
+                ("a".into(), false),
+                ("b".into(), false),
+                ("c".into(), false),
+            ],
+            selected: 0,
+        });
+        // j moves down
+        app.update(Action::Key(key(KeyCode::Char('j'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 1),
+            _ => panic!("expected FileBrowser"),
+        }
+        // k moves up
+        app.update(Action::Key(key(KeyCode::Char('k'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 0),
+            _ => panic!("expected FileBrowser"),
+        }
+        // G jumps to bottom
+        app.update(Action::Key(key(KeyCode::Char('G'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 2),
+            _ => panic!("expected FileBrowser"),
+        }
+        // g jumps to top
+        app.update(Action::Key(key(KeyCode::Char('g'))));
+        match &app.popup {
+            Some(Popup::FileBrowser { selected, .. }) => assert_eq!(*selected, 0),
+            _ => panic!("expected FileBrowser"),
+        }
+        // Esc closes
+        app.update(Action::Key(key(KeyCode::Esc)));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn file_browser_backspace_goes_to_parent() {
+        let mut app = app_on_main();
+        app.active_group_id = Some("g1".into());
+        app.popup = Some(Popup::FileBrowser {
+            path: std::path::PathBuf::from("/tmp/subdir"),
+            entries: vec![("file.txt".into(), false)],
+            selected: 0,
+        });
+        app.update(Action::Key(key(KeyCode::Backspace)));
+        match &app.popup {
+            Some(Popup::FileBrowser { path, selected, .. }) => {
+                assert_eq!(path, &std::path::PathBuf::from("/tmp"));
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("Expected FileBrowser after backspace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn scan_dir_sorts_dirs_first_and_hides_dotfiles() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join("wn_tui_test_scan_dir");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("banana.txt"), "").unwrap();
+        fs::write(tmp.join("apple.txt"), "").unwrap();
+        fs::create_dir(tmp.join("zebra_dir")).unwrap();
+        fs::create_dir(tmp.join("alpha_dir")).unwrap();
+        fs::write(tmp.join(".hidden"), "").unwrap();
+
+        let entries = App::scan_dir(&tmp);
+        // Hidden files excluded
+        assert!(!entries.iter().any(|(n, _)| n.starts_with('.')));
+        // Dirs come first
+        assert_eq!(entries[0], ("alpha_dir".into(), true));
+        assert_eq!(entries[1], ("zebra_dir".into(), true));
+        // Files after dirs
+        assert_eq!(entries[2], ("apple.txt".into(), false));
+        assert_eq!(entries[3], ("banana.txt".into(), false));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn upload_error_shows_popup() {
+        let mut app = app_on_main();
+        app.update(Action::MediaUploadError("file not found".into()));
+        match &app.popup {
+            Some(Popup::Error { message }) => {
+                assert!(message.contains("file not found"));
+            }
+            other => panic!("Expected Error popup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn upload_success_logs() {
+        let mut app = app_on_main();
+        app.update(Action::MediaUploaded);
+        assert!(app.logs.iter().any(|l| l.contains("uploaded successfully")));
     }
 }

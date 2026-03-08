@@ -85,7 +85,7 @@ pub fn draw(app: &mut App, frame: &mut Frame, area: Rect) {
     let not_set = "(not set)";
 
     // Split info area horizontally if we have an image
-    let (image_area, text_area) = if has_image {
+    let (image_area, text_area) = if has_image && vertical[0].width >= 48 {
         let cols = Layout::horizontal([
             Constraint::Length(20), // Image column
             Constraint::Fill(1),    // Text fields

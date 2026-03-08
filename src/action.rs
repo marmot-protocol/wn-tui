@@ -35,6 +35,35 @@ pub enum Action {
     ReactionError(String),
     MessagesLoaded(Vec<Value>),
 
+    // Message deletion
+    MessageDeleted {
+        message_id: String,
+    },
+    MessageDeleteError(String),
+
+    // Media upload
+    MediaUploaded,
+    MediaUploadError(String),
+
+    // Media
+    MediaDownloaded {
+        file_hash: String,
+        file_path: String,
+    },
+    MediaDownloadFailed {
+        file_hash: String,
+        error: String,
+    },
+    MediaImageLoaded {
+        file_hash: String,
+        bytes: Vec<u8>,
+    },
+    MediaPopupReady {
+        bytes: Vec<u8>,
+        img_width: u32,
+        img_height: u32,
+    },
+
     // Notifications (streaming)
     NotificationUpdate(Value),
     NotificationStreamEnded,
@@ -109,6 +138,7 @@ pub enum Effect {
         account: String,
         group_id: String,
         text: String,
+        reply_to: Option<String>,
     },
 
     LoadMessages {
@@ -124,6 +154,11 @@ pub enum Effect {
         emoji: String,
     },
     UnreactToMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
+    },
+    DeleteMessage {
         account: String,
         group_id: String,
         message_id: String,
@@ -236,6 +271,25 @@ pub enum Effect {
     // Account management
     Logout {
         account: String,
+    },
+
+    // Media
+    DownloadMedia {
+        account: String,
+        group_id: String,
+        file_hash: String,
+    },
+    LoadMediaImage {
+        file_hash: String,
+        file_path: String,
+    },
+    LoadMediaPopup {
+        file_path: String,
+    },
+    UploadMedia {
+        account: String,
+        group_id: String,
+        file_path: String,
     },
 
     // Daemon logs
