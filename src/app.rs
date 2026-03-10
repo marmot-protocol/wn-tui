@@ -135,6 +135,8 @@ pub struct App {
     pub message_scroll: usize,
     pub selected_message: Option<usize>,
     pub message_viewport_height: usize,
+    /// Index range of messages currently visible in the viewport (updated each render).
+    pub visible_msg_range: (usize, usize),
     pub composer: Input,
     /// Active reply context: (event_id, author_name, content_preview).
     pub reply_to: Option<(String, String, String)>,
@@ -216,6 +218,7 @@ impl App {
             message_scroll: 0,
             selected_message: None,
             message_viewport_height: 20, // updated each render
+            visible_msg_range: (0, 0),
             composer: Input::new(),
             reply_to: None,
             unread_counts: HashMap::new(),
@@ -796,7 +799,11 @@ impl App {
         self.media_downloads.clear();
         self.inline_images.clear();
         self.reply_to = None;
-        vec![Effect::CheckAccounts]
+        vec![
+            Effect::UnsubscribeMessages,
+            Effect::UnsubscribeSearch,
+            Effect::CheckAccounts,
+        ]
     }
 
     fn handle_logout(&mut self) -> Vec<Effect> {
@@ -1623,27 +1630,24 @@ impl App {
         }
     }
 
-    /// Nudge viewport scroll by 1 if the selection moved outside the visible range.
+    /// Nudge viewport scroll if the selection moved outside the visible range.
+    ///
+    /// Uses `visible_msg_range` (updated each render) to know exactly which
+    /// messages are on screen. Only scrolls when the selection is truly off-screen.
     fn scroll_to_follow(&mut self, direction: isize) {
         let sel = match self.selected_msg_index() {
             Some(i) => i,
             None => return,
         };
         let last = self.messages.len().saturating_sub(1);
-        let bottom_visible = last.saturating_sub(self.message_scroll);
+        let (vis_first, vis_last) = self.visible_msg_range;
 
-        if direction > 0 && sel > bottom_visible {
-            // Selection below viewport — scroll down by 1
+        if direction > 0 && sel > vis_last {
+            // Selection moved below the visible range — scroll down
             self.message_scroll = self.message_scroll.saturating_sub(1);
-        } else if direction < 0 {
-            // Selection moved up — scroll up only if selection is no longer rendered.
-            // The viewport fits ~message_viewport_height rows. Assume each message
-            // averages 1 row (short messages). If selection is more than viewport_height
-            // messages above the bottom, it's likely off-screen.
-            let distance_from_bottom = bottom_visible.saturating_sub(sel);
-            if distance_from_bottom >= self.message_viewport_height {
-                self.message_scroll += 1;
-            }
+        } else if direction < 0 && sel < vis_first {
+            // Selection moved above the visible range — scroll up
+            self.message_scroll = (self.message_scroll + 1).min(last);
         }
     }
 
@@ -4307,6 +4311,51 @@ mod tests {
         assert_eq!(app.message_scroll, 0, "should auto-scroll");
     }
 
+    // ── scroll_to_follow ────────────────────────────────────────────
+
+    #[test]
+    fn scroll_to_follow_noop_when_selection_visible() {
+        let mut app = app_on_main();
+        app.messages = (0..20)
+            .map(|i| json!({"id": format!("m{i}"), "content": format!("msg{i}"), "author": "a"}))
+            .collect();
+        app.message_scroll = 0; // at bottom
+                                // Simulate visible range: messages 10-19 are visible
+        app.visible_msg_range = (10, 19);
+        app.selected_message = Some(15); // within visible range
+        app.scroll_to_follow(1);
+        assert_eq!(
+            app.message_scroll, 0,
+            "should not scroll when selection is visible"
+        );
+    }
+
+    #[test]
+    fn scroll_to_follow_scrolls_up_when_above_visible() {
+        let mut app = app_on_main();
+        app.messages = (0..20)
+            .map(|i| json!({"id": format!("m{i}"), "content": format!("msg{i}"), "author": "a"}))
+            .collect();
+        app.message_scroll = 0;
+        app.visible_msg_range = (10, 19);
+        app.selected_message = Some(9); // above visible range
+        app.scroll_to_follow(-1);
+        assert_eq!(app.message_scroll, 1, "should scroll up by 1");
+    }
+
+    #[test]
+    fn scroll_to_follow_scrolls_down_when_below_visible() {
+        let mut app = app_on_main();
+        app.messages = (0..20)
+            .map(|i| json!({"id": format!("m{i}"), "content": format!("msg{i}"), "author": "a"}))
+            .collect();
+        app.message_scroll = 5;
+        app.visible_msg_range = (5, 14);
+        app.selected_message = Some(15); // below visible range
+        app.scroll_to_follow(1);
+        assert_eq!(app.message_scroll, 4, "should scroll down by 1");
+    }
+
     // ── Reactions ─────────────────────────────────────────────────────
 
     #[test]
@@ -4875,6 +4924,12 @@ mod tests {
         assert!(app.messages.is_empty());
         assert!(app.active_group_id.is_none());
         assert!(effects.iter().any(|e| matches!(e, Effect::CheckAccounts)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::UnsubscribeMessages)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::UnsubscribeSearch)));
     }
 
     #[test]

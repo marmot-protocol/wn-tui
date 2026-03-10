@@ -155,6 +155,7 @@ fn draw_messages(app: &mut App, frame: &mut Frame, area: Rect) {
         .loading(app.messages_loading)
         .media_downloads(&app.media_downloads)
         .inline_images(&app.inline_images);
+    app.visible_msg_range = widget.visible_range(area);
     let image_rects = widget.image_positions(area);
     frame.render_widget(widget, area);
 

@@ -19,18 +19,8 @@ fn draw_relays(relays: &[Value], frame: &mut Frame, area: Rect) {
             .get("url")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let status = relay
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown");
-        let (indicator, color) = match status {
-            "Connected" => ("●", Color::Green),
-            "Connecting" => ("◌", Color::Yellow),
-            _ => ("○", Color::Red),
-        };
         lines.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(format!("{indicator} "), Style::default().fg(color)),
             Span::styled(url, Style::default().fg(Color::White)),
         ]));
     }
