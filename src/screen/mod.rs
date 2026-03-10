@@ -1,4 +1,5 @@
 pub mod group_detail;
+pub mod health;
 pub mod login;
 pub mod main_screen;
 pub mod profile;
@@ -14,4 +15,5 @@ pub enum Screen {
     Profile,
     Settings,
     UserSearch,
+    Health,
 }

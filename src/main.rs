@@ -197,7 +197,6 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::ExportNsec { .. } => "ExportNsec",
         Effect::FetchProfileImage { .. } => "FetchProfileImage",
         Effect::LoadSettings { .. } => "LoadSettings",
-        Effect::UpdateSetting { .. } => "UpdateSetting",
         Effect::LoadFollows { .. } => "LoadFollows",
         Effect::FollowUser { .. } => "FollowUser",
         Effect::UnfollowUser { .. } => "UnfollowUser",
@@ -210,6 +209,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::LoadMediaImage { .. } => "LoadMediaImage",
         Effect::LoadMediaPopup { .. } => "LoadMediaPopup",
         Effect::UploadMedia { .. } => "UploadMedia",
+        Effect::LoadRelayHealth => "LoadRelayHealth",
         Effect::TailDaemonLog => "TailDaemonLog",
     };
     send_log(tx, format!("Effect: {effect_name}"));
@@ -872,22 +872,6 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
             });
         }
 
-        Effect::UpdateSetting {
-            account,
-            key,
-            value,
-        } => {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let action =
-                    match wn::exec(&["--account", &account, "settings", &key, &value]).await {
-                        Ok(_) => Action::SettingsUpdateSuccess(format!("{key} updated")),
-                        Err(e) => Action::SettingsUpdateError(e.to_string()),
-                    };
-                let _ = tx.send(Event::Action(action));
-            });
-        }
-
         Effect::LoadFollows { account } => {
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -1117,6 +1101,17 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                 {
                     Ok(_) => Action::MediaUploaded,
                     Err(e) => Action::MediaUploadError(e.to_string()),
+                };
+                let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::LoadRelayHealth => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let action = match wn::exec(&["debug", "relay-control-state"]).await {
+                    Ok(val) => Action::RelayHealthLoaded(val),
+                    Err(e) => Action::RelayHealthError(e.to_string()),
                 };
                 let _ = tx.send(Event::Action(action));
             });

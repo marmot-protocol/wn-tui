@@ -641,12 +641,6 @@ impl Widget for MessageListWidget<'_> {
     }
 }
 
-/// Calculate the maximum scroll offset for the message list.
-#[allow(dead_code)]
-pub fn max_scroll(message_count: usize, visible_height: usize) -> usize {
-    message_count.saturating_sub(visible_height)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,13 +671,6 @@ mod tests {
         let msg = json!({"created_at": 1709400000});
         let ts = timestamp(&msg);
         assert!(!ts.is_empty());
-    }
-
-    #[test]
-    fn max_scroll_calculation() {
-        assert_eq!(max_scroll(100, 20), 80);
-        assert_eq!(max_scroll(5, 20), 0);
-        assert_eq!(max_scroll(20, 20), 0);
     }
 
     #[test]

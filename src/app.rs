@@ -98,6 +98,14 @@ pub enum SearchPurpose {
     AddMember { group_id: String },
 }
 
+/// Relay health display mode.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum HealthView {
+    #[default]
+    ByStatus,
+    ByPlane,
+}
+
 /// State of a media download.
 #[derive(Debug, Clone)]
 pub enum MediaDownload {
@@ -167,8 +175,6 @@ pub struct App {
 
     // Settings
     pub settings_data: Option<Value>,
-    #[allow(dead_code)]
-    pub selected_setting: usize,
 
     // Follows
     pub follows: Vec<Value>,
@@ -186,6 +192,13 @@ pub struct App {
     // Media
     pub media_downloads: HashMap<String, MediaDownload>,
     pub inline_images: HashMap<String, StatefulProtocol>,
+
+    // Relay health
+    pub relay_health: Option<Value>,
+    pub health_error: Option<String>,
+    pub health_scroll: usize,
+    pub health_max_scroll: usize,
+    pub health_view: HealthView,
 
     // Log panel
     pub show_logs: bool,
@@ -236,7 +249,6 @@ impl App {
             profile_image: None,
             popup_image: None,
             settings_data: None,
-            selected_setting: 0,
             follows: Vec::new(),
             follows_loading: false,
             selected_follow: 0,
@@ -248,6 +260,11 @@ impl App {
             follow_checks: HashMap::new(),
             media_downloads: HashMap::new(),
             inline_images: HashMap::new(),
+            relay_health: None,
+            health_error: None,
+            health_scroll: 0,
+            health_max_scroll: 0,
+            health_view: HealthView::default(),
             show_logs: false,
             logs: Vec::new(),
             daemon_logs: Vec::new(),
@@ -582,18 +599,19 @@ impl App {
             Action::SettingsLoaded(val) => {
                 self.settings_data = Some(val);
             }
-            Action::SettingsUpdateSuccess(msg) => {
-                self.status_message = Some(msg);
-                if let Some(account) = &self.account {
-                    return vec![Effect::LoadSettings {
-                        account: account.clone(),
-                    }];
-                }
-            }
             Action::SettingsUpdateError(msg) => {
                 self.popup = Some(Popup::Error {
                     message: format!("Error: {msg}"),
                 });
+            }
+
+            // Relay health
+            Action::RelayHealthLoaded(val) => {
+                self.relay_health = Some(val);
+                self.health_error = None;
+            }
+            Action::RelayHealthError(msg) => {
+                self.health_error = Some(msg);
             }
 
             // Follows
@@ -1021,7 +1039,9 @@ impl App {
         }
 
         // Tab switches log tabs when log panel is visible (on screens where Tab isn't used)
-        if key.code == KeyCode::Tab && self.show_logs && !matches!(self.screen, Screen::UserSearch)
+        if key.code == KeyCode::Tab
+            && self.show_logs
+            && !matches!(self.screen, Screen::UserSearch | Screen::Health)
         {
             self.log_tab = match self.log_tab {
                 LogTab::Activity => LogTab::Daemon,
@@ -1038,6 +1058,7 @@ impl App {
             Screen::Profile => self.handle_profile_key(key),
             Screen::Settings => self.handle_settings_key(key),
             Screen::UserSearch => self.handle_search_key(key),
+            Screen::Health => self.handle_health_key(key),
         }
     }
 
@@ -1574,6 +1595,14 @@ impl App {
                 // Switch account — reset UI state and go to account selector
                 // (does NOT call wn logout — just navigates to the picker)
                 self.reset_to_account_select()
+            }
+            KeyCode::Char('h') => {
+                self.screen = Screen::Health;
+                self.relay_health = None;
+                self.health_error = None;
+                self.health_scroll = 0;
+                self.health_view = HealthView::default();
+                vec![Effect::LoadRelayHealth]
             }
             KeyCode::Char('q') => {
                 self.running = false;
@@ -2196,6 +2225,43 @@ impl App {
         }
     }
 
+    // ── Health screen key handling ──────────────────────────────────────
+
+    fn handle_health_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::Main;
+                self.relay_health = None;
+                vec![]
+            }
+            KeyCode::Tab => {
+                self.health_view = match self.health_view {
+                    HealthView::ByStatus => HealthView::ByPlane,
+                    HealthView::ByPlane => HealthView::ByStatus,
+                };
+                self.health_scroll = 0;
+                vec![]
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.health_scroll = self
+                    .health_scroll
+                    .saturating_add(1)
+                    .min(self.health_max_scroll);
+                vec![]
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.health_scroll = self.health_scroll.saturating_sub(1);
+                vec![]
+            }
+            KeyCode::Char('r') => {
+                self.health_error = None;
+                self.health_scroll = 0;
+                vec![Effect::LoadRelayHealth]
+            }
+            _ => vec![],
+        }
+    }
+
     // ── User search key handling ──────────────────────────────────────
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -2543,6 +2609,7 @@ impl App {
             Screen::Profile => crate::screen::profile::draw(self, frame, area),
             Screen::Settings => crate::screen::settings::draw(self, frame, area),
             Screen::UserSearch => crate::screen::user_search::draw(self, frame, area),
+            Screen::Health => crate::screen::health::draw(self, frame, area),
         }
 
         if show_global_logs {
@@ -3089,6 +3156,7 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("g", "Group info"));
             lines.push(hint("I", "View invites"));
             lines.push(hint("p", "Profile"));
+            lines.push(hint("h", "Relay health"));
             lines.push(hint("S", "Settings"));
             lines.push(hint("/", "Search users"));
             lines.push(hint("`", "Toggle logs"));
@@ -3120,6 +3188,12 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("Esc", "Back"));
         }
         Screen::Settings => {
+            lines.push(hint("Esc", "Back"));
+        }
+        Screen::Health => {
+            lines.push(hint("Tab", "Switch view (status / plane)"));
+            lines.push(hint("j / k", "Scroll"));
+            lines.push(hint("r", "Refresh"));
             lines.push(hint("Esc", "Back"));
         }
         Screen::Login => {
