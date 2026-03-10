@@ -127,9 +127,11 @@ pub struct App {
     // Main screen
     pub focus: Panel,
     pub chats: Vec<Value>,
+    pub chats_loading: bool,
     pub selected_chat: usize,
     pub active_group_id: Option<String>,
     pub messages: Vec<Value>,
+    pub messages_loading: bool,
     pub message_scroll: usize,
     pub selected_message: Option<usize>,
     pub message_viewport_height: usize,
@@ -148,6 +150,8 @@ pub struct App {
     pub group_detail: Option<Value>,
     pub group_members: Vec<Value>,
     pub group_admins: Vec<Value>,
+    pub group_relays: Vec<String>,
+    pub account_relays: Vec<Value>,
     pub selected_member: usize,
 
     // Popup
@@ -166,11 +170,13 @@ pub struct App {
 
     // Follows
     pub follows: Vec<Value>,
+    pub follows_loading: bool,
     pub selected_follow: usize,
 
     // User search
     pub search_input: Input,
     pub search_results: Vec<Value>,
+    pub search_loading: bool,
     pub selected_result: usize,
     pub search_purpose: SearchPurpose,
     pub follow_checks: HashMap<String, bool>,
@@ -202,9 +208,11 @@ impl App {
             status_message: None,
             focus: Panel::ChatList,
             chats: Vec::new(),
+            chats_loading: false,
             selected_chat: 0,
             active_group_id: None,
             messages: Vec::new(),
+            messages_loading: false,
             message_scroll: 0,
             selected_message: None,
             message_viewport_height: 20, // updated each render
@@ -216,6 +224,8 @@ impl App {
             group_detail: None,
             group_members: Vec::new(),
             group_admins: Vec::new(),
+            group_relays: Vec::new(),
+            account_relays: Vec::new(),
             selected_member: 0,
             popup: None,
             profile: None,
@@ -225,9 +235,11 @@ impl App {
             settings_data: None,
             selected_setting: 0,
             follows: Vec::new(),
+            follows_loading: false,
             selected_follow: 0,
             search_input: Input::new(),
             search_results: Vec::new(),
+            search_loading: false,
             selected_result: 0,
             search_purpose: SearchPurpose::Browse,
             follow_checks: HashMap::new(),
@@ -273,10 +285,12 @@ impl App {
             // Chat streaming
             Action::ChatUpdate(val) => {
                 self.connected = true;
+                self.chats_loading = false;
                 self.handle_chat_update(val);
             }
             Action::ChatStreamEnded => {
                 self.connected = false;
+                self.chats_loading = false;
                 // Auto-reconnect if we have an account
                 if let Some(account) = &self.account {
                     return vec![Effect::SubscribeChats {
@@ -288,14 +302,18 @@ impl App {
             // Message streaming
             Action::MessageUpdate { group_id, message } => {
                 if self.active_group_id.as_deref() == Some(&group_id) {
+                    self.messages_loading = false;
                     return self.handle_message_update(message);
                 }
             }
-            Action::MessageStreamEnded => {}
+            Action::MessageStreamEnded => {
+                self.messages_loading = false;
+            }
 
             // Send
             Action::MessageSent => {}
             Action::MessageSendError(msg) => {
+                self.messages_loading = false;
                 self.popup = Some(Popup::Error {
                     message: format!("Send failed: {msg}"),
                 });
@@ -312,6 +330,7 @@ impl App {
                 }
             }
             Action::MessagesLoaded(msgs) => {
+                self.messages_loading = false;
                 self.messages = msgs;
                 let mut effects = Vec::new();
                 for msg in &self.messages {
@@ -440,6 +459,12 @@ impl App {
                 self.group_members = members;
                 self.group_admins = admins;
                 self.selected_member = 0;
+            }
+            Action::GroupRelaysLoaded(relays) => {
+                self.group_relays = relays;
+            }
+            Action::AccountRelaysLoaded(relays) => {
+                self.account_relays = relays;
             }
             Action::InvitesLoaded(invites) => {
                 if invites.is_empty() {
@@ -570,6 +595,7 @@ impl App {
 
             // Follows
             Action::FollowsLoaded(list) => {
+                self.follows_loading = false;
                 self.follows = list;
                 if self.selected_follow >= self.follows.len() {
                     self.selected_follow = self.follows.len().saturating_sub(1);
@@ -592,6 +618,7 @@ impl App {
 
             // User search
             Action::SearchResult(val) => {
+                self.search_loading = false;
                 let pubkey = val
                     .get("pubkey")
                     .or_else(|| val.get("npub"))
@@ -607,7 +634,9 @@ impl App {
                     }
                 }
             }
-            Action::SearchStreamEnded => {}
+            Action::SearchStreamEnded => {
+                self.search_loading = false;
+            }
             Action::UserProfileLoaded(data) => {
                 let url = data
                     .get("metadata")
@@ -667,6 +696,10 @@ impl App {
                     account: account.clone(),
                     group_id: group_id.clone(),
                 },
+                Effect::LoadGroupRelays {
+                    account: account.clone(),
+                    group_id: group_id.clone(),
+                },
             ]
         } else {
             vec![]
@@ -695,7 +728,9 @@ impl App {
         self.login_mode = LoginMode::Menu;
         self.focus = Panel::ChatList;
         self.chats.clear();
+        self.chats_loading = true;
         self.messages.clear();
+        self.messages_loading = false;
         self.active_group_id = None;
         self.unread_counts.clear();
         self.connected = false;
@@ -740,7 +775,9 @@ impl App {
         self.account = None;
         self.status_message = None;
         self.chats.clear();
+        self.chats_loading = false;
         self.messages.clear();
+        self.messages_loading = false;
         self.active_group_id = None;
         self.unread_counts.clear();
         self.connected = false;
@@ -748,11 +785,14 @@ impl App {
         self.profile = None;
         self.profile_image = None;
         self.follows.clear();
+        self.follows_loading = false;
         self.follow_checks.clear();
         self.viewing_group_id = None;
         self.group_detail = None;
         self.group_members.clear();
         self.group_admins.clear();
+        self.group_relays.clear();
+        self.account_relays.clear();
         self.media_downloads.clear();
         self.inline_images.clear();
         self.reply_to = None;
@@ -778,6 +818,7 @@ impl App {
 
     fn clear_search_results(&mut self) {
         self.search_results.clear();
+        self.search_loading = false;
         self.follow_checks.clear();
         self.selected_result = 0;
     }
@@ -1490,10 +1531,15 @@ impl App {
                 self.screen = Screen::Profile;
                 self.profile = None;
                 self.selected_follow = 0;
-                let acct = account.clone();
+                self.follows_loading = true;
                 vec![
-                    Effect::LoadProfile { account },
-                    Effect::LoadFollows { account: acct },
+                    Effect::LoadProfile {
+                        account: account.clone(),
+                    },
+                    Effect::LoadFollows {
+                        account: account.clone(),
+                    },
+                    Effect::LoadAccountRelays { account },
                 ]
             }
             KeyCode::Char('S') => {
@@ -1549,6 +1595,7 @@ impl App {
         self.group_detail = None;
         self.group_members.clear();
         self.group_admins.clear();
+        self.group_relays.clear();
         self.selected_member = 0;
         self.status_message = None;
 
@@ -1557,7 +1604,11 @@ impl App {
                 account: account.clone(),
                 group_id: group_id.clone(),
             },
-            Effect::LoadGroupMembers { account, group_id },
+            Effect::LoadGroupMembers {
+                account: account.clone(),
+                group_id: group_id.clone(),
+            },
+            Effect::LoadGroupRelays { account, group_id },
         ]
     }
 
@@ -1870,6 +1921,7 @@ impl App {
 
         self.active_group_id = Some(group_id.clone());
         self.messages.clear();
+        self.messages_loading = true;
         self.media_downloads.clear();
         self.inline_images.clear();
         self.reply_to = None;
@@ -1894,6 +1946,7 @@ impl App {
                 self.group_detail = None;
                 self.group_members.clear();
                 self.group_admins.clear();
+                self.group_relays.clear();
                 vec![]
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -2117,7 +2170,7 @@ impl App {
                 };
                 self.popup = Some(Popup::Confirm {
                     title: "Logout".into(),
-                    message: "Log out of this account? (y/n)".into(),
+                    message: "All local data for this account will be permanently deleted.".into(),
                     purpose: ConfirmPurpose::Logout { account },
                 });
                 vec![]
@@ -2194,6 +2247,7 @@ impl App {
                     };
                     let query = self.search_input.value.clone();
                     self.clear_search_results();
+                    self.search_loading = true;
                     vec![Effect::SearchUsers { account, query }]
                 } else {
                     vec![]
@@ -2362,7 +2416,7 @@ impl App {
                             .unwrap_or("this account");
                         self.popup = Some(Popup::Confirm {
                             title: "Logout".into(),
-                            message: format!("Log out of \"{name}\"? (y/n)"),
+                            message: format!("Log out of \"{name}\"?\nAll local data will be permanently deleted."),
                             purpose: ConfirmPurpose::Logout {
                                 account: account_id,
                             },
@@ -2511,16 +2565,18 @@ impl App {
                 frame.render_widget(widget, area);
             }
             Popup::Confirm { title, message, .. } => {
+                let mut body: Vec<Line> = vec![Line::raw("")];
+                for line in message.split('\n') {
+                    body.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                let height = (body.len() as u16 + 5).max(8);
                 let widget = PopupWidget::new(title)
-                    .body(vec![
-                        Line::raw(""),
-                        Line::from(Span::styled(
-                            message.as_str(),
-                            Style::default().fg(Color::Yellow),
-                        )),
-                    ])
+                    .body(body)
                     .hints(vec![("y", "Yes"), ("n", "No")])
-                    .size(50, 8);
+                    .size(55, height);
                 frame.render_widget(widget, area);
             }
             Popup::Help { screen } => {

@@ -10,17 +10,34 @@ mod wn;
 use anyhow::Result;
 use tokio::process::Child;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use action::{Action, Effect};
 use app::App;
 use event::{map_event, Event, EventLoop};
 
-/// Tracks long-lived child processes for streaming commands.
+/// Wrapper that kills a child process when dropped.
+///
+/// Uses `start_kill()` (synchronous SIGKILL) so it's safe to call from `Drop`.
+/// This ensures spawned CLI processes are cleaned up when their reader task is
+/// aborted or completes.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.start_kill();
+    }
+}
+
+/// Tracks spawned reader tasks for streaming CLI commands.
+///
+/// Aborting the task drops the `KillOnDrop` guard inside it, which kills the
+/// underlying child process.
 struct StreamHandles {
-    chats: Option<Child>,
-    messages: Option<Child>,
-    notifications: Option<Child>,
-    search: Option<Child>,
+    chats: Option<JoinHandle<()>>,
+    messages: Option<JoinHandle<()>>,
+    notifications: Option<JoinHandle<()>>,
+    search: Option<JoinHandle<()>>,
 }
 
 impl StreamHandles {
@@ -34,34 +51,26 @@ impl StreamHandles {
     }
 
     fn kill_messages(&mut self) {
-        if let Some(mut child) = self.messages.take() {
-            tokio::spawn(async move {
-                let _ = child.kill().await;
-            });
+        if let Some(handle) = self.messages.take() {
+            handle.abort();
         }
     }
 
     fn kill_chats(&mut self) {
-        if let Some(mut child) = self.chats.take() {
-            tokio::spawn(async move {
-                let _ = child.kill().await;
-            });
+        if let Some(handle) = self.chats.take() {
+            handle.abort();
         }
     }
 
     fn kill_notifications(&mut self) {
-        if let Some(mut child) = self.notifications.take() {
-            tokio::spawn(async move {
-                let _ = child.kill().await;
-            });
+        if let Some(handle) = self.notifications.take() {
+            handle.abort();
         }
     }
 
     fn kill_search(&mut self) {
-        if let Some(mut child) = self.search.take() {
-            tokio::spawn(async move {
-                let _ = child.kill().await;
-            });
+        if let Some(handle) = self.search.take() {
+            handle.abort();
         }
     }
 
@@ -173,6 +182,8 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::DeleteMessage { .. } => "DeleteMessage",
         Effect::LoadGroupDetail { .. } => "LoadGroupDetail",
         Effect::LoadGroupMembers { .. } => "LoadGroupMembers",
+        Effect::LoadGroupRelays { .. } => "LoadGroupRelays",
+        Effect::LoadAccountRelays { .. } => "LoadAccountRelays",
         Effect::LoadInvites { .. } => "LoadInvites",
         Effect::CreateGroup { .. } => "CreateGroup",
         Effect::AddMember { .. } => "AddMember",
@@ -269,10 +280,10 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::SubscribeNotifications => {
             streams.kill_notifications();
             let tx = tx.clone();
-            tokio::spawn(async move {
+            streams.notifications = Some(tokio::spawn(async move {
                 match wn::stream(&["notifications", "subscribe"]).await {
                     Ok((child, mut rx)) => {
-                        drop(child);
+                        let _child = KillOnDrop(child);
                         while let Some(val) = rx.recv().await {
                             let notif = val
                                 .get("result")
@@ -294,17 +305,17 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                         // Notifications are non-critical — silently fail
                     }
                 }
-            });
+            }));
         }
 
         Effect::SubscribeChats { account } => {
             streams.kill_chats();
             let tx = tx.clone();
-            tokio::spawn(async move {
+            streams.chats = Some(tokio::spawn(async move {
                 match wn::stream(&["--account", &account, "chats", "subscribe"]).await {
                     Ok((child, mut rx)) => {
+                        let _child = KillOnDrop(child);
                         send_log(&tx, "Chats stream connected");
-                        drop(child);
                         while let Some(val) = rx.recv().await {
                             // Stream sends {"result": {"item": {...}, "trigger": "..."}}
                             // Extract the inner item (the actual chat object)
@@ -329,21 +340,21 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                         ))));
                     }
                 }
-            });
+            }));
         }
 
         Effect::SubscribeMessages { account, group_id } => {
             streams.kill_messages();
             let tx = tx.clone();
-            tokio::spawn(async move {
+            streams.messages = Some(tokio::spawn(async move {
                 match wn::stream(&["--account", &account, "messages", "subscribe", &group_id]).await
                 {
                     Ok((child, mut rx)) => {
+                        let _child = KillOnDrop(child);
                         send_log(
                             &tx,
                             format!("Messages stream connected (group: {group_id})"),
                         );
-                        drop(child);
                         let gid = group_id.clone();
                         while let Some(val) = rx.recv().await {
                             // Messages come as {"result": {"message": {...}, "trigger": "..."}}
@@ -368,7 +379,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                         ))));
                     }
                 }
-            });
+            }));
         }
 
         Effect::UnsubscribeMessages => {
@@ -500,6 +511,32 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                         Err(e) => Action::GroupActionError(e.to_string()),
                     };
                 let _ = tx.send(Event::Action(action));
+            });
+        }
+
+        Effect::LoadGroupRelays { account, group_id } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let relays =
+                    match wn::exec(&["--account", &account, "groups", "relays", &group_id]).await {
+                        Ok(serde_json::Value::Array(arr)) => arr
+                            .into_iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                        _ => vec![],
+                    };
+                let _ = tx.send(Event::Action(Action::GroupRelaysLoaded(relays)));
+            });
+        }
+
+        Effect::LoadAccountRelays { account } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let relays = match wn::exec(&["--account", &account, "relays", "list"]).await {
+                    Ok(serde_json::Value::Array(arr)) => arr,
+                    _ => vec![],
+                };
+                let _ = tx.send(Event::Action(Action::AccountRelaysLoaded(relays)));
             });
         }
 
@@ -914,10 +951,10 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
         Effect::SearchUsers { account, query } => {
             streams.kill_search();
             let tx = tx.clone();
-            tokio::spawn(async move {
+            streams.search = Some(tokio::spawn(async move {
                 match wn::stream(&["--account", &account, "users", "search", &query]).await {
                     Ok((child, mut rx)) => {
-                        drop(child);
+                        let _child = KillOnDrop(child);
                         while let Some(val) = rx.recv().await {
                             // Search results come as:
                             // {"result": {"new_results": [...users...], "trigger": "..."}}
@@ -943,7 +980,7 @@ fn execute_effect(effect: Effect, tx: &mpsc::UnboundedSender<Event>, streams: &m
                         ))));
                     }
                 }
-            });
+            }));
         }
 
         Effect::UnsubscribeSearch => {

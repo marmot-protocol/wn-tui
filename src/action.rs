@@ -74,6 +74,8 @@ pub enum Action {
         members: Vec<Value>,
         admins: Vec<Value>,
     },
+    GroupRelaysLoaded(Vec<String>),
+    AccountRelaysLoaded(Vec<Value>),
     InvitesLoaded(Vec<Value>),
     GroupActionSuccess(String),
     GroupActionError(String),
@@ -172,6 +174,13 @@ pub enum Effect {
     LoadGroupMembers {
         account: String,
         group_id: String,
+    },
+    LoadGroupRelays {
+        account: String,
+        group_id: String,
+    },
+    LoadAccountRelays {
+        account: String,
     },
     LoadInvites {
         account: String,

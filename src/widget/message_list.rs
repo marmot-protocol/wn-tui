@@ -373,6 +373,7 @@ pub struct MessageListWidget<'a> {
     my_pubkey: Option<&'a str>,
     /// If set, highlight this message index (absolute index into messages slice).
     selected: Option<usize>,
+    loading: bool,
     media_downloads: Option<&'a HashMap<String, MediaDownload>>,
     inline_images: Option<&'a HashMap<String, StatefulProtocol>>,
 }
@@ -385,6 +386,7 @@ impl<'a> MessageListWidget<'a> {
             block: None,
             my_pubkey: None,
             selected: None,
+            loading: false,
             media_downloads: None,
             inline_images: None,
         }
@@ -402,6 +404,11 @@ impl<'a> MessageListWidget<'a> {
 
     pub fn selected(mut self, selected: Option<usize>) -> Self {
         self.selected = selected;
+        self
+    }
+
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
         self
     }
 
@@ -541,11 +548,13 @@ impl Widget for MessageListWidget<'_> {
 
         if inner.height == 0 || inner.width == 0 || self.messages.is_empty() {
             if self.messages.is_empty() {
-                let empty = Paragraph::new(Span::styled(
-                    "No messages yet",
-                    Style::default().fg(Color::DarkGray),
-                ))
-                .centered();
+                let (text, color) = if self.loading {
+                    ("Loading messages...", Color::Yellow)
+                } else {
+                    ("No messages yet", Color::DarkGray)
+                };
+                let empty =
+                    Paragraph::new(Span::styled(text, Style::default().fg(color))).centered();
                 empty.render(inner, buf);
             }
             return;

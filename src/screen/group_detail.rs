@@ -91,24 +91,35 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
 
     let detail = app.group_detail.as_ref().unwrap();
 
-    // Layout: info section + members list + hints
+    // Layout: info section + relays + members list + hints
+    let relay_height = if app.group_relays.is_empty() {
+        0
+    } else {
+        app.group_relays.len() as u16 + 2 // header + relays + blank line
+    };
     let vertical = Layout::vertical([
-        Constraint::Length(5), // Group info
-        Constraint::Length(1), // Separator
-        Constraint::Fill(1),   // Members list
-        Constraint::Length(2), // Hints
+        Constraint::Length(5),            // Group info
+        Constraint::Length(relay_height), // Relays (0 if empty)
+        Constraint::Length(1),            // Separator
+        Constraint::Fill(1),              // Members list
+        Constraint::Length(2),            // Hints
     ])
     .split(inner);
 
     // Group info
     draw_info(detail, &app.group_members, frame, vertical[0]);
 
+    // Relays
+    if !app.group_relays.is_empty() {
+        draw_relays(&app.group_relays, frame, vertical[1]);
+    }
+
     // Separator
     let sep = Paragraph::new(Span::styled(
         "─── Members ───",
         Style::default().fg(Color::DarkGray),
     ));
-    frame.render_widget(sep, vertical[1]);
+    frame.render_widget(sep, vertical[2]);
 
     // Members list
     draw_members(
@@ -116,11 +127,11 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
         &app.group_admins,
         app.selected_member,
         frame,
-        vertical[2],
+        vertical[3],
     );
 
     // Hints
-    draw_hints(frame, vertical[3]);
+    draw_hints(frame, vertical[4]);
 }
 
 fn draw_info(detail: &Value, members: &[Value], frame: &mut Frame, area: Rect) {
@@ -157,6 +168,20 @@ fn draw_info(detail: &Value, members: &[Value], frame: &mut Frame, area: Rect) {
         ]),
     ];
 
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_relays(relays: &[String], frame: &mut Frame, area: Rect) {
+    let mut lines = vec![Line::from(Span::styled(
+        "  Relays:",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for url in relays {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(url, Style::default().fg(Color::White)),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 

@@ -59,6 +59,7 @@ fn draw_chat_list(app: &App, frame: &mut Frame, area: Rect) {
 
     let widget = ChatListWidget::new(&app.chats, app.selected_chat)
         .focused(focused)
+        .loading(app.chats_loading)
         .unread(&app.unread_counts)
         .block(block);
 
@@ -151,6 +152,7 @@ fn draw_messages(app: &mut App, frame: &mut Frame, area: Rect) {
         .block(block)
         .my_pubkey(app.account.as_deref())
         .selected(selected)
+        .loading(app.messages_loading)
         .media_downloads(&app.media_downloads)
         .inline_images(&app.inline_images);
     let image_rects = widget.image_positions(area);

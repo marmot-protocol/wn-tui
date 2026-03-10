@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, StatefulWidget, Widget},
+    widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget},
 };
 use serde_json::Value;
 
@@ -42,6 +42,7 @@ pub struct ChatListWidget<'a> {
     chats: &'a [Value],
     selected: usize,
     focused: bool,
+    loading: bool,
     block: Option<Block<'a>>,
     unread: &'a HashMap<String, usize>,
 }
@@ -52,9 +53,15 @@ impl<'a> ChatListWidget<'a> {
             chats,
             selected,
             focused: false,
+            loading: false,
             block: None,
             unread: &EMPTY_MAP,
         }
+    }
+
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
     }
 
     pub fn unread(mut self, unread: &'a HashMap<String, usize>) -> Self {
@@ -85,6 +92,20 @@ impl Widget for ChatListWidget<'_> {
             .block
             .unwrap_or_default()
             .border_style(Style::default().fg(border_color));
+
+        if self.chats.is_empty() {
+            let inner = block.inner(area);
+            block.render(area, buf);
+            if self.loading {
+                let text = Paragraph::new(Span::styled(
+                    "Loading...",
+                    Style::default().fg(Color::Yellow),
+                ))
+                .centered();
+                text.render(inner, buf);
+            }
+            return;
+        }
 
         let items: Vec<ListItem> = self
             .chats
