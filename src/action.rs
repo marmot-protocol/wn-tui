@@ -74,6 +74,8 @@ pub enum Action {
         members: Vec<Value>,
         admins: Vec<Value>,
     },
+    GroupRelaysLoaded(Vec<String>),
+    AccountRelaysLoaded(Vec<Value>),
     InvitesLoaded(Vec<Value>),
     GroupActionSuccess(String),
     GroupActionError(String),
@@ -88,7 +90,6 @@ pub enum Action {
 
     // Settings
     SettingsLoaded(Value),
-    SettingsUpdateSuccess(String),
     SettingsUpdateError(String),
 
     // Follows
@@ -109,6 +110,10 @@ pub enum Action {
     // Account management
     LogoutSuccess,
     LogoutError(String),
+
+    // Relay health
+    RelayHealthLoaded(Value),
+    RelayHealthError(String),
 
     // Logs
     Log(String),
@@ -173,6 +178,13 @@ pub enum Effect {
         account: String,
         group_id: String,
     },
+    LoadGroupRelays {
+        account: String,
+        group_id: String,
+    },
+    LoadAccountRelays {
+        account: String,
+    },
     LoadInvites {
         account: String,
     },
@@ -233,12 +245,6 @@ pub enum Effect {
     LoadSettings {
         account: String,
     },
-    #[allow(dead_code)]
-    UpdateSetting {
-        account: String,
-        key: String,
-        value: String,
-    },
 
     // Follows
     LoadFollows {
@@ -291,6 +297,9 @@ pub enum Effect {
         group_id: String,
         file_path: String,
     },
+
+    // Relay health
+    LoadRelayHealth,
 
     // Daemon logs
     TailDaemonLog,

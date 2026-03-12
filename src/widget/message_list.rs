@@ -373,6 +373,7 @@ pub struct MessageListWidget<'a> {
     my_pubkey: Option<&'a str>,
     /// If set, highlight this message index (absolute index into messages slice).
     selected: Option<usize>,
+    loading: bool,
     media_downloads: Option<&'a HashMap<String, MediaDownload>>,
     inline_images: Option<&'a HashMap<String, StatefulProtocol>>,
 }
@@ -385,6 +386,7 @@ impl<'a> MessageListWidget<'a> {
             block: None,
             my_pubkey: None,
             selected: None,
+            loading: false,
             media_downloads: None,
             inline_images: None,
         }
@@ -405,6 +407,11 @@ impl<'a> MessageListWidget<'a> {
         self
     }
 
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
+    }
+
     pub fn media_downloads(mut self, downloads: &'a HashMap<String, MediaDownload>) -> Self {
         self.media_downloads = Some(downloads);
         self
@@ -418,7 +425,11 @@ impl<'a> MessageListWidget<'a> {
 
 impl MessageListWidget<'_> {
     /// Compute which messages are visible and their Y positions.
-    /// Returns (visible_msg_indices, inner_area).
+    /// Returns (visible_msg_indices_with_y, inner_area).
+    ///
+    /// `scroll_from_bottom` determines the anchor: the newest message that should
+    /// be visible. We then fill backward from the anchor to find how many older
+    /// messages fit, and render forward from that start index to fill the viewport.
     fn compute_visible(&self, area: Rect) -> (Vec<(usize, usize)>, Rect) {
         let inner = if let Some(block) = &self.block {
             block.inner(area)
@@ -433,32 +444,48 @@ impl MessageListWidget<'_> {
         let visible_height = inner.height as usize;
         let width = inner.width as usize;
         let total = self.messages.len();
-        let skip_messages = self.scroll_from_bottom.min(total);
+        let skip = self.scroll_from_bottom.min(total.saturating_sub(1));
 
-        let mut visible_msgs: Vec<usize> = Vec::new();
-        let mut used_rows = 0;
+        // The anchor is the newest message that should be on screen.
+        let anchor = total.saturating_sub(1 + skip);
 
-        let end = total.saturating_sub(skip_messages);
-        for i in (0..end).rev() {
+        // Walk backward from the anchor to find the topmost message that fits.
+        let mut start = anchor;
+        let mut used_rows =
+            message_height_with_images(&self.messages[anchor], width, self.inline_images);
+        for i in (0..anchor).rev() {
             let h = message_height_with_images(&self.messages[i], width, self.inline_images);
             if used_rows + h > visible_height {
                 break;
             }
             used_rows += h;
-            visible_msgs.push(i);
+            start = i;
         }
-        visible_msgs.reverse();
 
-        // Compute Y positions
+        // Render forward from start, filling the viewport top-down.
         let mut result = Vec::new();
         let mut y = inner.y as usize;
-        for idx in visible_msgs {
-            result.push((idx, y));
-            let h = message_height_with_images(&self.messages[idx], width, self.inline_images);
+        let y_limit = inner.y as usize + visible_height;
+        for i in start..total {
+            let h = message_height_with_images(&self.messages[i], width, self.inline_images);
+            if !result.is_empty() && y + h > y_limit {
+                break;
+            }
+            result.push((i, y));
             y += h;
         }
 
         (result, inner)
+    }
+
+    /// Return the (first, last) visible message indices for this area.
+    /// Returns (0, 0) if nothing is visible.
+    pub fn visible_range(&self, area: Rect) -> (usize, usize) {
+        let (visible, _) = self.compute_visible(area);
+        match (visible.first(), visible.last()) {
+            (Some(&(first, _)), Some(&(last, _))) => (first, last),
+            _ => (0, 0),
+        }
     }
 
     /// Compute the positions where inline images should be rendered.
@@ -541,11 +568,13 @@ impl Widget for MessageListWidget<'_> {
 
         if inner.height == 0 || inner.width == 0 || self.messages.is_empty() {
             if self.messages.is_empty() {
-                let empty = Paragraph::new(Span::styled(
-                    "No messages yet",
-                    Style::default().fg(Color::DarkGray),
-                ))
-                .centered();
+                let (text, color) = if self.loading {
+                    ("Loading messages...", Color::Yellow)
+                } else {
+                    ("No messages yet", Color::DarkGray)
+                };
+                let empty =
+                    Paragraph::new(Span::styled(text, Style::default().fg(color))).centered();
                 empty.render(inner, buf);
             }
             return;
@@ -612,12 +641,6 @@ impl Widget for MessageListWidget<'_> {
     }
 }
 
-/// Calculate the maximum scroll offset for the message list.
-#[allow(dead_code)]
-pub fn max_scroll(message_count: usize, visible_height: usize) -> usize {
-    message_count.saturating_sub(visible_height)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,13 +671,6 @@ mod tests {
         let msg = json!({"created_at": 1709400000});
         let ts = timestamp(&msg);
         assert!(!ts.is_empty());
-    }
-
-    #[test]
-    fn max_scroll_calculation() {
-        assert_eq!(max_scroll(100, 20), 80);
-        assert_eq!(max_scroll(5, 20), 0);
-        assert_eq!(max_scroll(20, 20), 0);
     }
 
     #[test]
@@ -999,5 +1015,101 @@ mod tests {
         let lines = format_message(&msg, None, None, None, &[]);
         assert_eq!(lines.len(), 1);
         assert_eq!(message_height(&msg, 80), 1);
+    }
+
+    // ── compute_visible / visible_range tests ──────────────────────────
+
+    /// Build N short (1-row) messages for viewport tests.
+    fn short_msgs(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                json!({
+                    "content": format!("msg{i}"),
+                    "author": "a",
+                    "created_at_local": "2026-01-01 10:00:00"
+                })
+            })
+            .collect()
+    }
+
+    /// Helper: compute visible_range for given messages, scroll, and viewport.
+    fn vis_range(msgs: &[Value], scroll: usize, height: u16, width: u16) -> (usize, usize) {
+        let w = MessageListWidget::new(msgs, scroll);
+        w.visible_range(Rect::new(0, 0, width, height))
+    }
+
+    #[test]
+    fn visible_range_at_bottom_shows_newest() {
+        let msgs = short_msgs(20);
+        let (first, last) = vis_range(&msgs, 0, 10, 80);
+        assert_eq!(last, 19, "last visible should be the newest message");
+        assert_eq!(first, 10, "first visible should be 10 messages from end");
+    }
+
+    #[test]
+    fn visible_range_scroll_to_top_fills_forward() {
+        // Regression: pressing 'g' sets scroll = total - 1. This must show
+        // message 0 at the top and fill the viewport forward — not just 1 message.
+        let msgs = short_msgs(20);
+        let scroll = msgs.len() - 1; // = 19, same as pressing 'g'
+        let (first, last) = vis_range(&msgs, scroll, 10, 80);
+        assert_eq!(first, 0, "should start at the oldest message");
+        assert!(
+            last >= 9,
+            "should fill viewport with ~10 messages, got last={last}"
+        );
+    }
+
+    #[test]
+    fn visible_range_mid_scroll() {
+        let msgs = short_msgs(30);
+        let (first, last) = vis_range(&msgs, 10, 10, 80);
+        // anchor = 29 - 10 = 19, backward fill 10 msgs, forward from 10
+        assert_eq!(last, 19);
+        assert_eq!(first, 10);
+    }
+
+    #[test]
+    fn visible_range_all_messages_fit() {
+        let msgs = short_msgs(5);
+        let (first, last) = vis_range(&msgs, 0, 20, 80);
+        assert_eq!(first, 0);
+        assert_eq!(last, 4, "all 5 messages should be visible");
+    }
+
+    #[test]
+    fn visible_range_oversized_message_not_blank() {
+        // A message taller than the viewport must still produce a non-empty result.
+        let msgs = vec![json!({
+            "content": "x\n".repeat(50), // 50+ rows
+            "author": "a",
+            "created_at_local": "2026-01-01 10:00:00"
+        })];
+        let (first, last) = vis_range(&msgs, 0, 10, 80);
+        assert_eq!(first, 0, "oversized message must still be visible");
+        assert_eq!(last, 0);
+    }
+
+    #[test]
+    fn visible_range_oversized_message_mid_list() {
+        // Short messages around an oversized one: viewport should include it.
+        let mut msgs = short_msgs(3);
+        msgs.insert(
+            1,
+            json!({
+                "content": "x\n".repeat(50),
+                "author": "a",
+                "created_at_local": "2026-01-01 10:00:00"
+            }),
+        );
+        // total = 4 messages, anchor = msg 3 (scroll=0)
+        // backward fill from msg 3: msg 2 fits (1 row), msg 1 (50+ rows) doesn't fit
+        // start = 2, forward render: msg 2, msg 3
+        let (_first, last) = vis_range(&msgs, 0, 10, 80);
+        assert!(last == 3, "newest message should be visible");
+        // When scrolling to the oversized message (anchor = 1):
+        let (first2, last2) = vis_range(&msgs, 2, 10, 80);
+        assert_eq!(first2, 1, "oversized msg should be first visible");
+        assert!(last2 >= 1, "at least the oversized message is shown");
     }
 }

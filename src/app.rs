@@ -98,6 +98,14 @@ pub enum SearchPurpose {
     AddMember { group_id: String },
 }
 
+/// Relay health display mode.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum HealthView {
+    #[default]
+    ByStatus,
+    ByPlane,
+}
+
 /// State of a media download.
 #[derive(Debug, Clone)]
 pub enum MediaDownload {
@@ -127,12 +135,16 @@ pub struct App {
     // Main screen
     pub focus: Panel,
     pub chats: Vec<Value>,
+    pub chats_loading: bool,
     pub selected_chat: usize,
     pub active_group_id: Option<String>,
     pub messages: Vec<Value>,
+    pub messages_loading: bool,
     pub message_scroll: usize,
     pub selected_message: Option<usize>,
     pub message_viewport_height: usize,
+    /// Index range of messages currently visible in the viewport (updated each render).
+    pub visible_msg_range: (usize, usize),
     pub composer: Input,
     /// Active reply context: (event_id, author_name, content_preview).
     pub reply_to: Option<(String, String, String)>,
@@ -148,6 +160,8 @@ pub struct App {
     pub group_detail: Option<Value>,
     pub group_members: Vec<Value>,
     pub group_admins: Vec<Value>,
+    pub group_relays: Vec<String>,
+    pub account_relays: Vec<Value>,
     pub selected_member: usize,
 
     // Popup
@@ -161,16 +175,16 @@ pub struct App {
 
     // Settings
     pub settings_data: Option<Value>,
-    #[allow(dead_code)]
-    pub selected_setting: usize,
 
     // Follows
     pub follows: Vec<Value>,
+    pub follows_loading: bool,
     pub selected_follow: usize,
 
     // User search
     pub search_input: Input,
     pub search_results: Vec<Value>,
+    pub search_loading: bool,
     pub selected_result: usize,
     pub search_purpose: SearchPurpose,
     pub follow_checks: HashMap<String, bool>,
@@ -178,6 +192,13 @@ pub struct App {
     // Media
     pub media_downloads: HashMap<String, MediaDownload>,
     pub inline_images: HashMap<String, StatefulProtocol>,
+
+    // Relay health
+    pub relay_health: Option<Value>,
+    pub health_error: Option<String>,
+    pub health_scroll: usize,
+    pub health_max_scroll: usize,
+    pub health_view: HealthView,
 
     // Log panel
     pub show_logs: bool,
@@ -202,12 +223,15 @@ impl App {
             status_message: None,
             focus: Panel::ChatList,
             chats: Vec::new(),
+            chats_loading: false,
             selected_chat: 0,
             active_group_id: None,
             messages: Vec::new(),
+            messages_loading: false,
             message_scroll: 0,
             selected_message: None,
             message_viewport_height: 20, // updated each render
+            visible_msg_range: (0, 0),
             composer: Input::new(),
             reply_to: None,
             unread_counts: HashMap::new(),
@@ -216,6 +240,8 @@ impl App {
             group_detail: None,
             group_members: Vec::new(),
             group_admins: Vec::new(),
+            group_relays: Vec::new(),
+            account_relays: Vec::new(),
             selected_member: 0,
             popup: None,
             profile: None,
@@ -223,16 +249,22 @@ impl App {
             profile_image: None,
             popup_image: None,
             settings_data: None,
-            selected_setting: 0,
             follows: Vec::new(),
+            follows_loading: false,
             selected_follow: 0,
             search_input: Input::new(),
             search_results: Vec::new(),
+            search_loading: false,
             selected_result: 0,
             search_purpose: SearchPurpose::Browse,
             follow_checks: HashMap::new(),
             media_downloads: HashMap::new(),
             inline_images: HashMap::new(),
+            relay_health: None,
+            health_error: None,
+            health_scroll: 0,
+            health_max_scroll: 0,
+            health_view: HealthView::default(),
             show_logs: false,
             logs: Vec::new(),
             daemon_logs: Vec::new(),
@@ -273,10 +305,12 @@ impl App {
             // Chat streaming
             Action::ChatUpdate(val) => {
                 self.connected = true;
+                self.chats_loading = false;
                 self.handle_chat_update(val);
             }
             Action::ChatStreamEnded => {
                 self.connected = false;
+                self.chats_loading = false;
                 // Auto-reconnect if we have an account
                 if let Some(account) = &self.account {
                     return vec![Effect::SubscribeChats {
@@ -288,14 +322,18 @@ impl App {
             // Message streaming
             Action::MessageUpdate { group_id, message } => {
                 if self.active_group_id.as_deref() == Some(&group_id) {
+                    self.messages_loading = false;
                     return self.handle_message_update(message);
                 }
             }
-            Action::MessageStreamEnded => {}
+            Action::MessageStreamEnded => {
+                self.messages_loading = false;
+            }
 
             // Send
             Action::MessageSent => {}
             Action::MessageSendError(msg) => {
+                self.messages_loading = false;
                 self.popup = Some(Popup::Error {
                     message: format!("Send failed: {msg}"),
                 });
@@ -312,6 +350,7 @@ impl App {
                 }
             }
             Action::MessagesLoaded(msgs) => {
+                self.messages_loading = false;
                 self.messages = msgs;
                 let mut effects = Vec::new();
                 for msg in &self.messages {
@@ -441,6 +480,12 @@ impl App {
                 self.group_admins = admins;
                 self.selected_member = 0;
             }
+            Action::GroupRelaysLoaded(relays) => {
+                self.group_relays = relays;
+            }
+            Action::AccountRelaysLoaded(relays) => {
+                self.account_relays = relays;
+            }
             Action::InvitesLoaded(invites) => {
                 if invites.is_empty() {
                     self.status_message = Some("No pending invites".into());
@@ -554,22 +599,24 @@ impl App {
             Action::SettingsLoaded(val) => {
                 self.settings_data = Some(val);
             }
-            Action::SettingsUpdateSuccess(msg) => {
-                self.status_message = Some(msg);
-                if let Some(account) = &self.account {
-                    return vec![Effect::LoadSettings {
-                        account: account.clone(),
-                    }];
-                }
-            }
             Action::SettingsUpdateError(msg) => {
                 self.popup = Some(Popup::Error {
                     message: format!("Error: {msg}"),
                 });
             }
 
+            // Relay health
+            Action::RelayHealthLoaded(val) => {
+                self.relay_health = Some(val);
+                self.health_error = None;
+            }
+            Action::RelayHealthError(msg) => {
+                self.health_error = Some(msg);
+            }
+
             // Follows
             Action::FollowsLoaded(list) => {
+                self.follows_loading = false;
                 self.follows = list;
                 if self.selected_follow >= self.follows.len() {
                     self.selected_follow = self.follows.len().saturating_sub(1);
@@ -592,6 +639,7 @@ impl App {
 
             // User search
             Action::SearchResult(val) => {
+                self.search_loading = false;
                 let pubkey = val
                     .get("pubkey")
                     .or_else(|| val.get("npub"))
@@ -607,7 +655,9 @@ impl App {
                     }
                 }
             }
-            Action::SearchStreamEnded => {}
+            Action::SearchStreamEnded => {
+                self.search_loading = false;
+            }
             Action::UserProfileLoaded(data) => {
                 let url = data
                     .get("metadata")
@@ -667,6 +717,10 @@ impl App {
                     account: account.clone(),
                     group_id: group_id.clone(),
                 },
+                Effect::LoadGroupRelays {
+                    account: account.clone(),
+                    group_id: group_id.clone(),
+                },
             ]
         } else {
             vec![]
@@ -695,7 +749,9 @@ impl App {
         self.login_mode = LoginMode::Menu;
         self.focus = Panel::ChatList;
         self.chats.clear();
+        self.chats_loading = true;
         self.messages.clear();
+        self.messages_loading = false;
         self.active_group_id = None;
         self.unread_counts.clear();
         self.connected = false;
@@ -740,7 +796,9 @@ impl App {
         self.account = None;
         self.status_message = None;
         self.chats.clear();
+        self.chats_loading = false;
         self.messages.clear();
+        self.messages_loading = false;
         self.active_group_id = None;
         self.unread_counts.clear();
         self.connected = false;
@@ -748,15 +806,22 @@ impl App {
         self.profile = None;
         self.profile_image = None;
         self.follows.clear();
+        self.follows_loading = false;
         self.follow_checks.clear();
         self.viewing_group_id = None;
         self.group_detail = None;
         self.group_members.clear();
         self.group_admins.clear();
+        self.group_relays.clear();
+        self.account_relays.clear();
         self.media_downloads.clear();
         self.inline_images.clear();
         self.reply_to = None;
-        vec![Effect::CheckAccounts]
+        vec![
+            Effect::UnsubscribeMessages,
+            Effect::UnsubscribeSearch,
+            Effect::CheckAccounts,
+        ]
     }
 
     fn handle_logout(&mut self) -> Vec<Effect> {
@@ -778,6 +843,7 @@ impl App {
 
     fn clear_search_results(&mut self) {
         self.search_results.clear();
+        self.search_loading = false;
         self.follow_checks.clear();
         self.selected_result = 0;
     }
@@ -973,7 +1039,9 @@ impl App {
         }
 
         // Tab switches log tabs when log panel is visible (on screens where Tab isn't used)
-        if key.code == KeyCode::Tab && self.show_logs && !matches!(self.screen, Screen::UserSearch)
+        if key.code == KeyCode::Tab
+            && self.show_logs
+            && !matches!(self.screen, Screen::UserSearch | Screen::Health)
         {
             self.log_tab = match self.log_tab {
                 LogTab::Activity => LogTab::Daemon,
@@ -990,6 +1058,7 @@ impl App {
             Screen::Profile => self.handle_profile_key(key),
             Screen::Settings => self.handle_settings_key(key),
             Screen::UserSearch => self.handle_search_key(key),
+            Screen::Health => self.handle_health_key(key),
         }
     }
 
@@ -1490,10 +1559,15 @@ impl App {
                 self.screen = Screen::Profile;
                 self.profile = None;
                 self.selected_follow = 0;
-                let acct = account.clone();
+                self.follows_loading = true;
                 vec![
-                    Effect::LoadProfile { account },
-                    Effect::LoadFollows { account: acct },
+                    Effect::LoadProfile {
+                        account: account.clone(),
+                    },
+                    Effect::LoadFollows {
+                        account: account.clone(),
+                    },
+                    Effect::LoadAccountRelays { account },
                 ]
             }
             KeyCode::Char('S') => {
@@ -1522,6 +1596,14 @@ impl App {
                 // (does NOT call wn logout — just navigates to the picker)
                 self.reset_to_account_select()
             }
+            KeyCode::Char('h') => {
+                self.screen = Screen::Health;
+                self.relay_health = None;
+                self.health_error = None;
+                self.health_scroll = 0;
+                self.health_view = HealthView::default();
+                vec![Effect::LoadRelayHealth]
+            }
             KeyCode::Char('q') => {
                 self.running = false;
                 vec![]
@@ -1549,6 +1631,7 @@ impl App {
         self.group_detail = None;
         self.group_members.clear();
         self.group_admins.clear();
+        self.group_relays.clear();
         self.selected_member = 0;
         self.status_message = None;
 
@@ -1557,7 +1640,11 @@ impl App {
                 account: account.clone(),
                 group_id: group_id.clone(),
             },
-            Effect::LoadGroupMembers { account, group_id },
+            Effect::LoadGroupMembers {
+                account: account.clone(),
+                group_id: group_id.clone(),
+            },
+            Effect::LoadGroupRelays { account, group_id },
         ]
     }
 
@@ -1572,27 +1659,24 @@ impl App {
         }
     }
 
-    /// Nudge viewport scroll by 1 if the selection moved outside the visible range.
+    /// Nudge viewport scroll if the selection moved outside the visible range.
+    ///
+    /// Uses `visible_msg_range` (updated each render) to know exactly which
+    /// messages are on screen. Only scrolls when the selection is truly off-screen.
     fn scroll_to_follow(&mut self, direction: isize) {
         let sel = match self.selected_msg_index() {
             Some(i) => i,
             None => return,
         };
         let last = self.messages.len().saturating_sub(1);
-        let bottom_visible = last.saturating_sub(self.message_scroll);
+        let (vis_first, vis_last) = self.visible_msg_range;
 
-        if direction > 0 && sel > bottom_visible {
-            // Selection below viewport — scroll down by 1
+        if direction > 0 && sel > vis_last {
+            // Selection moved below the visible range — scroll down
             self.message_scroll = self.message_scroll.saturating_sub(1);
-        } else if direction < 0 {
-            // Selection moved up — scroll up only if selection is no longer rendered.
-            // The viewport fits ~message_viewport_height rows. Assume each message
-            // averages 1 row (short messages). If selection is more than viewport_height
-            // messages above the bottom, it's likely off-screen.
-            let distance_from_bottom = bottom_visible.saturating_sub(sel);
-            if distance_from_bottom >= self.message_viewport_height {
-                self.message_scroll += 1;
-            }
+        } else if direction < 0 && sel < vis_first {
+            // Selection moved above the visible range — scroll up
+            self.message_scroll = (self.message_scroll + 1).min(last);
         }
     }
 
@@ -1870,6 +1954,7 @@ impl App {
 
         self.active_group_id = Some(group_id.clone());
         self.messages.clear();
+        self.messages_loading = true;
         self.media_downloads.clear();
         self.inline_images.clear();
         self.reply_to = None;
@@ -1894,6 +1979,7 @@ impl App {
                 self.group_detail = None;
                 self.group_members.clear();
                 self.group_admins.clear();
+                self.group_relays.clear();
                 vec![]
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -2117,7 +2203,7 @@ impl App {
                 };
                 self.popup = Some(Popup::Confirm {
                     title: "Logout".into(),
-                    message: "Log out of this account? (y/n)".into(),
+                    message: "All local data for this account will be permanently deleted.".into(),
                     purpose: ConfirmPurpose::Logout { account },
                 });
                 vec![]
@@ -2134,6 +2220,43 @@ impl App {
                 self.screen = Screen::Main;
                 self.settings_data = None;
                 vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    // ── Health screen key handling ──────────────────────────────────────
+
+    fn handle_health_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::Main;
+                self.relay_health = None;
+                vec![]
+            }
+            KeyCode::Tab => {
+                self.health_view = match self.health_view {
+                    HealthView::ByStatus => HealthView::ByPlane,
+                    HealthView::ByPlane => HealthView::ByStatus,
+                };
+                self.health_scroll = 0;
+                vec![]
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.health_scroll = self
+                    .health_scroll
+                    .saturating_add(1)
+                    .min(self.health_max_scroll);
+                vec![]
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.health_scroll = self.health_scroll.saturating_sub(1);
+                vec![]
+            }
+            KeyCode::Char('r') => {
+                self.health_error = None;
+                self.health_scroll = 0;
+                vec![Effect::LoadRelayHealth]
             }
             _ => vec![],
         }
@@ -2194,6 +2317,7 @@ impl App {
                     };
                     let query = self.search_input.value.clone();
                     self.clear_search_results();
+                    self.search_loading = true;
                     vec![Effect::SearchUsers { account, query }]
                 } else {
                     vec![]
@@ -2362,7 +2486,7 @@ impl App {
                             .unwrap_or("this account");
                         self.popup = Some(Popup::Confirm {
                             title: "Logout".into(),
-                            message: format!("Log out of \"{name}\"? (y/n)"),
+                            message: format!("Log out of \"{name}\"?\nAll local data will be permanently deleted."),
                             purpose: ConfirmPurpose::Logout {
                                 account: account_id,
                             },
@@ -2485,6 +2609,7 @@ impl App {
             Screen::Profile => crate::screen::profile::draw(self, frame, area),
             Screen::Settings => crate::screen::settings::draw(self, frame, area),
             Screen::UserSearch => crate::screen::user_search::draw(self, frame, area),
+            Screen::Health => crate::screen::health::draw(self, frame, area),
         }
 
         if show_global_logs {
@@ -2511,16 +2636,18 @@ impl App {
                 frame.render_widget(widget, area);
             }
             Popup::Confirm { title, message, .. } => {
+                let mut body: Vec<Line> = vec![Line::raw("")];
+                for line in message.split('\n') {
+                    body.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                let height = (body.len() as u16 + 5).max(8);
                 let widget = PopupWidget::new(title)
-                    .body(vec![
-                        Line::raw(""),
-                        Line::from(Span::styled(
-                            message.as_str(),
-                            Style::default().fg(Color::Yellow),
-                        )),
-                    ])
+                    .body(body)
                     .hints(vec![("y", "Yes"), ("n", "No")])
-                    .size(50, 8);
+                    .size(55, height);
                 frame.render_widget(widget, area);
             }
             Popup::Help { screen } => {
@@ -3029,6 +3156,7 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("g", "Group info"));
             lines.push(hint("I", "View invites"));
             lines.push(hint("p", "Profile"));
+            lines.push(hint("h", "Relay health"));
             lines.push(hint("S", "Settings"));
             lines.push(hint("/", "Search users"));
             lines.push(hint("`", "Toggle logs"));
@@ -3060,6 +3188,12 @@ fn help_lines(screen: &Screen) -> Vec<ratatui::text::Line<'static>> {
             lines.push(hint("Esc", "Back"));
         }
         Screen::Settings => {
+            lines.push(hint("Esc", "Back"));
+        }
+        Screen::Health => {
+            lines.push(hint("Tab", "Switch view (status / plane)"));
+            lines.push(hint("j / k", "Scroll"));
+            lines.push(hint("r", "Refresh"));
             lines.push(hint("Esc", "Back"));
         }
         Screen::Login => {
@@ -4251,6 +4385,51 @@ mod tests {
         assert_eq!(app.message_scroll, 0, "should auto-scroll");
     }
 
+    // ── scroll_to_follow ────────────────────────────────────────────
+
+    #[test]
+    fn scroll_to_follow_noop_when_selection_visible() {
+        let mut app = app_on_main();
+        app.messages = (0..20)
+            .map(|i| json!({"id": format!("m{i}"), "content": format!("msg{i}"), "author": "a"}))
+            .collect();
+        app.message_scroll = 0; // at bottom
+                                // Simulate visible range: messages 10-19 are visible
+        app.visible_msg_range = (10, 19);
+        app.selected_message = Some(15); // within visible range
+        app.scroll_to_follow(1);
+        assert_eq!(
+            app.message_scroll, 0,
+            "should not scroll when selection is visible"
+        );
+    }
+
+    #[test]
+    fn scroll_to_follow_scrolls_up_when_above_visible() {
+        let mut app = app_on_main();
+        app.messages = (0..20)
+            .map(|i| json!({"id": format!("m{i}"), "content": format!("msg{i}"), "author": "a"}))
+            .collect();
+        app.message_scroll = 0;
+        app.visible_msg_range = (10, 19);
+        app.selected_message = Some(9); // above visible range
+        app.scroll_to_follow(-1);
+        assert_eq!(app.message_scroll, 1, "should scroll up by 1");
+    }
+
+    #[test]
+    fn scroll_to_follow_scrolls_down_when_below_visible() {
+        let mut app = app_on_main();
+        app.messages = (0..20)
+            .map(|i| json!({"id": format!("m{i}"), "content": format!("msg{i}"), "author": "a"}))
+            .collect();
+        app.message_scroll = 5;
+        app.visible_msg_range = (5, 14);
+        app.selected_message = Some(15); // below visible range
+        app.scroll_to_follow(1);
+        assert_eq!(app.message_scroll, 4, "should scroll down by 1");
+    }
+
     // ── Reactions ─────────────────────────────────────────────────────
 
     #[test]
@@ -4819,6 +4998,12 @@ mod tests {
         assert!(app.messages.is_empty());
         assert!(app.active_group_id.is_none());
         assert!(effects.iter().any(|e| matches!(e, Effect::CheckAccounts)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::UnsubscribeMessages)));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::UnsubscribeSearch)));
     }
 
     #[test]

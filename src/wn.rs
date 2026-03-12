@@ -119,7 +119,14 @@ fn parse_stream_buf(buf: &mut Vec<u8>) -> ParseOutcome {
         let mut de = serde_json::Deserializer::from_slice(buf).into_iter::<Value>();
         let val = match de.next() {
             Some(Ok(v)) => v,
-            Some(Err(e)) if e.is_eof() => return ParseOutcome::Incomplete,
+            Some(Err(e)) if e.is_eof() => {
+                if values.is_empty() {
+                    return ParseOutcome::Incomplete;
+                }
+                // Yield already-parsed values; the incomplete tail stays in buf
+                // and will be completed on the next read.
+                break;
+            }
             Some(Err(_)) => {
                 // Malformed byte — discard and retry
                 buf.remove(0);
@@ -490,5 +497,19 @@ mod tests {
         let vals = extract_values(parse_stream_buf(&mut buf));
         assert_eq!(vals.len(), 1);
         assert_eq!(vals[0]["result"]["id"], 1);
+    }
+
+    #[test]
+    fn stream_parse_yields_complete_values_before_incomplete_tail() {
+        // Simulate a chunk that has two complete objects followed by a truncated third.
+        // Before the fix, the Incomplete return discarded the two good values.
+        let mut buf =
+            b"{\"result\":{\"id\":1}}{\"result\":{\"id\":2}}{\"result\":{\"id\":3".to_vec();
+        let vals = extract_values(parse_stream_buf(&mut buf));
+        assert_eq!(vals.len(), 2, "should yield the 2 complete values");
+        assert_eq!(vals[0]["result"]["id"], 1);
+        assert_eq!(vals[1]["result"]["id"], 2);
+        // The incomplete tail remains in the buffer
+        assert_eq!(buf, b"{\"result\":{\"id\":3");
     }
 }

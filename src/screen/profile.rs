@@ -7,7 +7,25 @@ use ratatui::{
 };
 use ratatui_image::StatefulImage;
 
+use serde_json::Value;
+
 use crate::app::{hex_to_npub, App};
+
+fn draw_relays(relays: &[Value], frame: &mut Frame, area: Rect) {
+    let label = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![Line::from(Span::styled("  Relays:", label))];
+    for relay in relays {
+        let url = relay
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(url, Style::default().fg(Color::White)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
 
 /// Format a profile field for display, showing "(not set)" when empty.
 fn display<'a>(val: &'a str, fallback: &'a str) -> &'a str {
@@ -53,9 +71,15 @@ pub fn draw(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let has_image = app.profile_image.is_some();
     let info_height = 9;
+    let relay_height = if app.account_relays.is_empty() {
+        0
+    } else {
+        app.account_relays.len() as u16 + 2 // header + relays + blank line
+    };
 
     let vertical = Layout::vertical([
         Constraint::Length(info_height), // Profile info (with optional image)
+        Constraint::Length(relay_height), // Relays (0 if empty)
         Constraint::Length(1),           // Follows header
         Constraint::Fill(1),             // Follows list
         Constraint::Length(2),           // Hints (2 rows)
@@ -140,6 +164,11 @@ pub fn draw(app: &mut App, frame: &mut Frame, area: Rect) {
     ];
     frame.render_widget(Paragraph::new(lines), text_area);
 
+    // Relays
+    if !app.account_relays.is_empty() {
+        draw_relays(&app.account_relays, frame, vertical[1]);
+    }
+
     // Follows header
     let follows_header = Line::from(vec![Span::styled(
         format!("  Following ({})", app.follows.len()),
@@ -147,15 +176,17 @@ pub fn draw(app: &mut App, frame: &mut Frame, area: Rect) {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     )]);
-    frame.render_widget(Paragraph::new(follows_header), vertical[1]);
+    frame.render_widget(Paragraph::new(follows_header), vertical[2]);
 
     // Follows list
     if app.follows.is_empty() {
-        let empty = Paragraph::new(Span::styled(
-            "  Not following anyone",
-            Style::default().fg(Color::DarkGray),
-        ));
-        frame.render_widget(empty, vertical[2]);
+        let (text, color) = if app.follows_loading {
+            ("  Loading follows...", Color::Yellow)
+        } else {
+            ("  Not following anyone", Color::DarkGray)
+        };
+        let empty = Paragraph::new(Span::styled(text, Style::default().fg(color)));
+        frame.render_widget(empty, vertical[3]);
     } else {
         let items: Vec<ListItem> = app
             .follows
@@ -197,12 +228,12 @@ pub fn draw(app: &mut App, frame: &mut Frame, area: Rect) {
         let list = List::new(items);
         let mut state = ListState::default();
         state.select(Some(app.selected_follow));
-        StatefulWidget::render(list, vertical[2], frame.buffer_mut(), &mut state);
+        StatefulWidget::render(list, vertical[3], frame.buffer_mut(), &mut state);
     }
 
     // Hints (2 rows)
     let hint_rows =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(vertical[3]);
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(vertical[4]);
 
     let line1 = Line::from(vec![
         Span::styled("  [n] ", Style::default().fg(Color::Cyan)),

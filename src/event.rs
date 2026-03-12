@@ -11,8 +11,7 @@ pub enum Event {
     Key(KeyEvent),
     Paste(String),
     Tick,
-    #[allow(dead_code)]
-    Resize(u16, u16),
+    Resize,
     /// Async task results injected back into the event loop.
     Action(Action),
 }
@@ -35,7 +34,7 @@ impl EventLoop {
                 let event = match evt {
                     CrosstermEvent::Key(key) => Event::Key(key),
                     CrosstermEvent::Paste(text) => Event::Paste(text),
-                    CrosstermEvent::Resize(w, h) => Event::Resize(w, h),
+                    CrosstermEvent::Resize(..) => Event::Resize,
                     _ => continue,
                 };
                 if tx_term.send(event).is_err() {
@@ -80,7 +79,7 @@ pub fn map_event(event: &Event) -> Option<Action> {
         Event::Key(key) => map_key_event(key),
         Event::Paste(text) => Some(Action::Paste(text.clone())),
         Event::Tick => Some(Action::Tick),
-        Event::Resize(_, _) => Some(Action::Render),
+        Event::Resize => Some(Action::Render),
         Event::Action(action) => Some(action.clone()),
     }
 }

@@ -40,15 +40,19 @@ pub fn draw(app: &App, frame: &mut Frame, area: Rect) {
         .render(vertical[0], frame.buffer_mut());
 
     // Result count
-    let count_text = if app.search_results.is_empty() {
+    let count_text = if app.search_loading {
+        "  Searching...".to_string()
+    } else if app.search_results.is_empty() {
         "  Type a query and press Enter to search".to_string()
     } else {
         format!("  {} result(s)", app.search_results.len())
     };
-    let count = Paragraph::new(Span::styled(
-        count_text,
-        Style::default().fg(Color::DarkGray),
-    ));
+    let count_color = if app.search_loading {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let count = Paragraph::new(Span::styled(count_text, Style::default().fg(count_color)));
     frame.render_widget(count, vertical[1]);
 
     // Results list
