@@ -20,8 +20,6 @@ A terminal user interface for [WhiteNoise](https://github.com/marmot-protocol/wh
 
 ## Prerequisites
 
-![Prerequisites](https://blossom.primal.net/4ffe7cedc7e70302e7b1636e4efb636c790f7949df3cb05a63993b4de800aa86.png)
-
 wn-tui is a pure presentation layer over the WhiteNoise CLI. It spawns `wn` commands as subprocesses and parses their JSON output. You need both the daemon and the CLI client running.
 
 ### 1. WhiteNoise daemon and CLI
@@ -53,8 +51,6 @@ Rust 1.79+ (2021 edition). Install via [rustup](https://rustup.rs/) if needed.
 
 ## Build & Run
 
-![Build & Run](https://blossom.primal.net/66c1bb570514611b98636bddf6d241b9ecef314edb4fa9cbdd2fbc2d1f39e995.png)
-
 ```sh
 cd wn-tui
 cargo build --release
@@ -68,8 +64,6 @@ cargo run
 ```
 
 ## Architecture
-
-![Architecture](https://blossom.primal.net/549d16a1d158e3a0e6d479d51184657a00ad571459a941672336b7d5e0598117.png)
 
 ### Communication model
 
@@ -120,8 +114,6 @@ Screens are an enum, not trait objects. Exhaustive matching ensures every screen
 
 ## Project structure
 
-![Project structure](https://blossom.primal.net/58dbd583e553c9a1422f24b928510b216a301d9810944eb5d4f099e46923cd0b.png)
-
 ```
 src/
   main.rs              Entry point, event loop, effect execution
@@ -148,8 +140,6 @@ src/
 ```
 
 ## Key bindings
-
-![Key bindings](https://blossom.primal.net/05341052898d315d59dffef6570c3481be3c0f1ecc6c2db9a5162c4cd585c49a.png)
 
 ### Global
 
