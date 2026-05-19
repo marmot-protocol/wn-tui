@@ -2045,6 +2045,22 @@ impl App {
                 vec![]
             }
             KeyCode::Char('L') => {
+                if let Some(account) = self.account.as_deref() {
+                    if crate::screen::group_detail::is_admin(account, &self.group_admins) {
+                        let message = if self.group_admins.len() <= 1 {
+                            "You're the only admin. Promote another member to admin \
+                             before you can leave."
+                        } else {
+                            "You're an admin of this group. Step down as admin \
+                             before leaving."
+                        };
+                        self.popup = Some(Popup::Info {
+                            title: "Cannot Leave Group".into(),
+                            message: message.into(),
+                        });
+                        return vec![];
+                    }
+                }
                 let name = self
                     .group_detail
                     .as_ref()
@@ -3688,6 +3704,67 @@ mod tests {
     #[test]
     fn l_uppercase_confirms_leave() {
         let mut app = app_on_group_detail();
+        app.update(Action::Key(key(KeyCode::Char('L'))));
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Confirm {
+                purpose: ConfirmPurpose::LeaveGroup,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn admin_leave_is_blocked_and_explained() {
+        let mut app = app_on_group_detail();
+        app.account = Some("alicehex".into());
+        app.group_admins = vec![
+            json!({"pubkey": "alicehex", "display_name": "Alice"}),
+            json!({"pubkey": "bobhex", "display_name": "Bob"}),
+        ];
+        app.update(Action::Key(key(KeyCode::Char('L'))));
+        match app.popup {
+            Some(Popup::Info {
+                ref title,
+                ref message,
+            }) => {
+                assert_eq!(title, "Cannot Leave Group");
+                assert_eq!(
+                    message,
+                    "You're an admin of this group. Step down as admin before leaving."
+                );
+            }
+            other => panic!("expected Popup::Info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_admin_leave_is_blocked_with_promotion_guidance() {
+        let mut app = app_on_group_detail();
+        app.account = Some("alicehex".into());
+        app.group_admins = vec![json!({"pubkey": "alicehex", "display_name": "Alice"})];
+        app.update(Action::Key(key(KeyCode::Char('L'))));
+        match app.popup {
+            Some(Popup::Info {
+                ref title,
+                ref message,
+            }) => {
+                assert_eq!(title, "Cannot Leave Group");
+                assert_eq!(
+                    message,
+                    "You're the only admin. Promote another member to admin \
+                     before you can leave."
+                );
+            }
+            other => panic!("expected Popup::Info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_admin_leave_opens_confirm_popup() {
+        let mut app = app_on_group_detail();
+        app.account = Some("bobhex".into());
+        app.group_admins = vec![json!({"pubkey": "alicehex", "display_name": "Alice"})];
         app.update(Action::Key(key(KeyCode::Char('L'))));
         assert!(matches!(
             app.popup,

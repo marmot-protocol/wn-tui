@@ -19,12 +19,15 @@ fn field(val: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
-/// Check if a member npub is in the admins list.
-fn is_admin(npub: &str, admins: &[Value]) -> bool {
+/// Check whether `pubkey` (hex, as returned by the daemon) appears in the admins list.
+///
+/// The admins list may contain bare strings or objects with `pubkey`/`npub` fields,
+/// so all three shapes are matched.
+pub fn is_admin(pubkey: &str, admins: &[Value]) -> bool {
     admins.iter().any(|a| {
-        a.as_str() == Some(npub)
-            || a.get("npub").and_then(|v| v.as_str()) == Some(npub)
-            || a.get("pubkey").and_then(|v| v.as_str()) == Some(npub)
+        a.as_str() == Some(pubkey)
+            || a.get("pubkey").and_then(|v| v.as_str()) == Some(pubkey)
+            || a.get("npub").and_then(|v| v.as_str()) == Some(pubkey)
     })
 }
 
