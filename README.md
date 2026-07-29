@@ -1,8 +1,18 @@
-# wn-tui
+# wn-tui (deprecated)
 
-![wn-tui](https://blossom.primal.net/ac0d58ade515b45cdc9281f86e2467a9df999394aa28e95ea093cadedf868aaa.png)
+> **This project is deprecated and no longer maintained.**
+>
+> Development has moved to the TUI in the MDK repository:
+> **https://github.com/marmot-protocol/mdk/tree/master/crates/cli**
+>
+> Please use that instead. This repository is kept for reference only and will be
+> archived. No further fixes, features, or reviews will land here.
+
+---
 
 A terminal user interface for [WhiteNoise](https://github.com/marmot-protocol/whitenoise-rs), a secure group messenger built on MLS and Nostr.
+
+Everything below describes the final state of this archived project.
 
 ```text
 +-[Chats]--------+-[Coffee Chat]-------------------------------+
